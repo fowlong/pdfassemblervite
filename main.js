@@ -195,7 +195,7 @@ function stringifyPdfTree(tree) {
   const seen = new WeakSet();
   return JSON.stringify(tree, function replacer(key, value) {
     if (typeof value === 'object' && value !== null) {
-      if (seen.has(value)) return { $ref: true };
+      if (seen.has(value)) return { $ref: true }; // avoid cycles
       seen.add(value);
     }
     return value;
@@ -228,16 +228,42 @@ async function assembleAndPreview() {
   toast('Assembled.');
 }
 
+// --- NEW: reconstruct assembler from the bytes we just built, then parse structure
+async function rehydrateTreeFromBytes() {
+  if (!state.lastUint8) return;
+  try {
+    const blob = new Blob([state.lastUint8], { type: 'application/pdf' });
+    const asm = new PDFAssembler(blob);
+    // reapply options so the next assemble matches UI toggles
+    asm.indent = els.indentToggle.checked ? 2 : false;
+    asm.compress = !!els.compressToggle.checked;
+
+    const fresh = await asm.getPDFStructure();
+    state.assembler = asm;
+    state.pdfTree = fresh;
+    els.jsonEditor.value = stringifyPdfTree(fresh);
+
+    try {
+      state.pageCount = await state.assembler.countPages();
+      els.pageIndex.max = state.pageCount || 1;
+    } catch {}
+  } catch (e) {
+    console.warn('rehydrate from bytes failed:', e);
+  }
+}
+
+// assemble → **recreate assembler from bytes** → rescan
 async function autoAssembleAndRescan() {
   if (state.assembling) return;
   try {
     state.assembling = true;
     await assembleAndPreview();
+    await rehydrateTreeFromBytes();   // << critical change
     scanTextItems();
     scanSafeItems();
   } catch (e) {
     console.error(e);
-    toast('Assemble failed. Likely invalid structure.', true);
+    toast('Assemble/rescan failed. See console.', true);
   } finally {
     state.assembling = false;
   }
@@ -269,7 +295,6 @@ function runRegexReplace() {
     return new RegExp(s, defaultFlags);
   }
 
-  let changed = 0;
   try {
     const re = buildRegExp(find, 'g');
     const kids = state.pdfTree?.['/Root']?.['/Pages']?.['/Kids'];
@@ -280,8 +305,7 @@ function runRegexReplace() {
       for (const s of streams) {
         if (!s || typeof s !== 'object') continue;
         if (typeof s.stream === 'string') {
-          const before = s.stream;
-          try { s.stream = before.replace(re, repl); if (s.stream !== before) changed++; }
+          try { s.stream = s.stream.replace(re, repl); }
           catch (inner) { console.error('Replace failed on a stream:', inner); }
         }
       }
@@ -319,7 +343,7 @@ function clearOverlay() { const octx = els.overlayCanvas.getContext('2d'); octx.
 // Simple draggable overlay
 const overlayItems = []; let dragIndex = -1; let lastDrag=null;
 function addOverlayTextbox(){ overlayItems.push({ x:100, y:100, text:'New text' }); drawOverlay(); }
-function drawOverlay(){ const ctx=els.overlayCanvas.getContext('2d'); ctx.clearRect(0,0,els.overlayCanvas.width,els.overlayCanvas.height); ctx.font='16px sans-serif'; ctx.fillStyle='#ffffff'; ctx.strokeStyle='#66ccff'; overlayItems.forEach(it=>{ ctx.fillText(it.text,it.x,it.y); const m=ctx.measureText(it.text); const w=m.width+8,h=22; ctx.strokeRect(it.x-4,it.y-16,w,h); }); }
+function drawOverlay(){ const ctx=els.overlayCanvas.getContext('2d'); ctx.clearRect(0,0,els.overlayCanvas.width,els.overlayCanvas.height); ctx.font='16px sans-serif'; ctx.fillStyle='#ffffff'; ctx.strokeStyle='#66ccff'; overlayItems.forEach(it=>{ ctx.fillText(it.text,it.x,it.y); const m=ctx.measureText(it.text).width+8,h=22; ctx.strokeRect(it.x-4,it.y-16,w,h); }); }
 els.overlayCanvas.addEventListener('mousedown',e=>{ const {x,y}=overlayPos(e); const i=hitIndex(x,y); dragIndex=i; lastDrag={x,y}; });
 els.overlayCanvas.addEventListener('mousemove',e=>{ if(dragIndex<0) return; const {x,y}=overlayPos(e); const dx=x-lastDrag.x,dy=y-lastDrag.y; overlayItems[dragIndex].x+=dx; overlayItems[dragIndex].y+=dy; lastDrag={x,y}; drawOverlay(); });
 ['mouseup','mouseleave'].forEach(ev=>els.overlayCanvas.addEventListener(ev,()=>dragIndex=-1));
@@ -358,7 +382,6 @@ function scanTokensTj(src) {
 }
 
 function isWs(ch){ return ch===' '||ch==='\n'||ch==='\r'||ch==='\t'||ch==='\f'||ch==='\v'; }
-function isDigit(ch){ return ch>='0'&&ch<='9'; }
 function readNumber(src,i){
   const m = /^-?\d+(?:\.\d+)?/.exec(src.slice(i));
   if (!m) return null;
@@ -376,7 +399,6 @@ function readPdfString(src,i){
       if (nxt === 'r'){ out+='\r'; j+=2; continue; }
       if (nxt === 't'){ out+='\t'; j+=2; continue; }
       if (nxt === 'b'||nxt==='f'){ j+=2; continue; }
-      // octal \ddd
       const oct = /^\\([0-7]{1,3})/.exec(src.slice(j));
       if (oct){ out += String.fromCharCode(parseInt(oct[1],8)); j += 1 + oct[1].length; continue; }
       out += nxt; j+=2; continue;
@@ -386,15 +408,12 @@ function readPdfString(src,i){
   }
   return { text: out, end: j };
 }
-// Read [ ... ] TJ where ... contains strings and numbers
+// Read [ ... ] TJ allowing whitespace/newlines between ']' and 'TJ'
 function scanTokensTJ(src){
   const out = [];
   for (let i=0;i<src.length;i++){
-    const ch = src[i];
-    if (ch !== '[') continue;
-    let j = i+1;
-    const segs = [];
-    // parse array body
+    if (src[i] !== '[') continue;
+    let j = i+1, segs = [];
     while (j < src.length) {
       while (j<src.length && isWs(src[j])) j++;
       if (src[j] === '(') {
@@ -404,15 +423,11 @@ function scanTokensTJ(src){
         j = s.end;
       } else if (src[j] === ']') {
         j++;
-        // skip spaces then require TJ
         let k=j; while (k<src.length && isWs(src[k])) k++;
         if (src.slice(k, k+2) === 'TJ') {
-          const tokStart = i;
-          const tokEnd = k+2;
-          const text = segs.map(s=>s.text).join('');
-          out.push({ kind:'TJ', tokStart, tokEnd, text, segs });
+          out.push({ kind:'TJ', tokStart:i, tokEnd:k+2, text: segs.map(s=>s.text).join(''), segs });
         }
-        i = j; // continue outer for
+        i = j;
         break;
       } else {
         const num = readNumber(src, j);
@@ -429,7 +444,7 @@ let TEXT_GROUPS = []; // [{pageIndex, items:[GroupItem]}]
 GroupItem {
   id, pageIndex, streamIndex, objRef,
   start, end, text, posType, x, y, posIndex, fontName, fontSize,
-  segments: [{start,end,text}]  // literal segments inside this token/group
+  segments: [{start,end,text}]
 }
 */
 
@@ -450,7 +465,6 @@ function scanTextItems(){
       const toks = [...scanTokensTj(src), ...scanTokensTJ(src)];
       toks.sort((a,b)=>a.tokStart-b.tokStart);
 
-      // gather positioning near each token
       const items = toks.map(t => {
         const tm = lastMatchBefore(/(-?\d+(?:\.\d+)?)\s+(-?\d+(?:\.\d+)?)\s+(-?\d+(?:\.\d+)?)\s+(-?\d+(?:\.\d+)?)\s+(-?\d+(?:\.\d+)?)\s+(-?\d+(?:\.\d+)?)\s+Tm/g, src, t.tokStart);
         const td = lastMatchBefore(/(-?\d+(?:\.\d+)?)\s+(-?\d+(?:\.\d+)?)\s+Td/g, src, t.tokStart);
@@ -583,12 +597,39 @@ function getObjRef(it){
   return (obj && typeof obj.stream === 'string') ? obj : null;
 }
 
-// Replace coalesced group with a safe single token: [(text)] TJ
+// Replace group with safe single token; re-find locally if needed
 async function replaceGroupText(it, newText){
   const obj = getObjRef(it); if(!obj) return toast('Stream not found.', true);
   const s = obj.stream;
   const replacement = `[(${pdfEscapeLiteral(newText)})] TJ`;
-  obj.stream = s.slice(0, it.start) + replacement + s.slice(it.end);
+
+  const slice = s.slice(it.start, it.end);
+  if (slice.length && s.indexOf(slice, Math.max(0, it.start - 4)) >= 0) {
+    obj.stream = s.slice(0, it.start) + replacement + s.slice(it.end);
+  } else {
+    const winStart = Math.max(0, it.start - 400);
+    const winEnd   = Math.min(s.length, it.end + 400);
+    const win = s.slice(winStart, winEnd);
+    const local = (() => {
+      const i = win.lastIndexOf('[', it.start - winStart);
+      let j = -1;
+      if (i >= 0) {
+        const close = win.indexOf(']', i + 1);
+        if (close > i) {
+          let k = close + 1; while (k < win.length && isWs(win[k])) k++;
+          if (win.slice(k, k + 2) === 'TJ') j = k + 2;
+        }
+      }
+      if (i >= 0 && j > i) return { a: winStart + i, b: winStart + j };
+      const k = win.lastIndexOf('(', it.start - winStart);
+      const l = win.indexOf(') Tj', Math.max(k + 1, 0));
+      if (k >= 0 && l > k) return { a: winStart + k, b: winStart + l + 3 };
+      return null;
+    })();
+    if (!local) return toast('Could not locate token to replace.', true);
+    obj.stream = s.slice(0, local.a) + replacement + s.slice(local.b);
+  }
+
   it.text = newText;
   els.jsonEditor.value = stringifyPdfTree(state.pdfTree);
   await autoAssembleAndRescan();
@@ -634,11 +675,12 @@ async function applyFontSize(it, size){
 
 // ---------------------- Fields & Metadata (beta) -------------------------
 
-let SAFE_GROUPS = [];
+let SAFE_GROUPS = []; // array of {title, items:[{kind, label, get(), set(newVal), preview()}]}
 
 function scanSafeItems(){
   SAFE_GROUPS = [];
 
+  // Document Info dictionary
   const info = state.pdfTree?.['/Info'];
   if (info && typeof info === 'object') {
     const items = [];
@@ -652,6 +694,7 @@ function scanSafeItems(){
     if (items.length) SAFE_GROUPS.push({ title: 'Document Info', items });
   }
 
+  // AcroForm text fields (/V as string)
   const fields = state.pdfTree?.['/Root']?.['/AcroForm']?.['/Fields'];
   if (Array.isArray(fields)) {
     const items = [];
@@ -665,6 +708,7 @@ function scanSafeItems(){
     if (items.length) SAFE_GROUPS.push({ title: 'Form fields (/V)', items });
   }
 
+  // Per-page rotation
   const kids = state.pdfTree?.['/Root']?.['/Pages']?.['/Kids'];
   if (Array.isArray(kids)) {
     const items = [];
@@ -676,6 +720,7 @@ function scanSafeItems(){
     if (items.length) SAFE_GROUPS.push({ title: 'Page rotation', items });
   }
 
+  // Annotation texts (/Contents)
   if (Array.isArray(kids)) {
     const items = [];
     kids.forEach((p, i) => {
