@@ -1,0 +1,102 @@
+<!doctype html>
+<html lang="en">
+  <head>
+    <meta charset="UTF-8" />
+    <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+    <title>PDFAssembler – Vite Browser PDF Editor</title>
+    <link rel="stylesheet" href="./style.css" />
+  </head>
+  <body>
+    <header>
+      <h1>PDFAssembler – Vite Browser PDF Editor</h1>
+      <div class="row">
+        <label class="file">
+          <input id="fileInput" type="file" accept="application/pdf" />
+          <span>Select PDF…</span>
+        </label>
+        <button id="loadSample">Load sample</button>
+        <button id="assembleBtn" disabled>Assemble & Preview</button>
+        <button id="downloadBtn" disabled>Download</button>
+        <label><input type="checkbox" id="indentToggle" /> indent output</label>
+        <label><input type="checkbox" id="compressToggle" checked /> compress streams</label>
+        <button id="removeRootBtn" disabled>Remove /Outlines & /PageLabels</button>
+        <button id="canvasModeBtn" disabled>Canvas Mode (overlay)</button>
+        <span id="status"></span>
+      </div>
+    </header>
+
+    <main>
+      <section class="left">
+        <h2>Editable PDF object structure</h2>
+        <div class="json-toolbar">
+          <button id="refreshPreviewBtn" disabled>Update from editor →</button>
+          <button id="syncFromTreeBtn" disabled>← Load latest structure</button>
+        </div>
+        <textarea id="jsonEditor" spellcheck="false" placeholder="Load a PDF to see and edit its object tree…"></textarea>
+
+        <details>
+          <summary>Quick actions (experimental)</summary>
+          <div class="quick-actions">
+            <label>Regex find: <input id="qaFind" placeholder="/Hello\\s+World/i or Hello\\s+World" /></label>
+            <label>Replace with: <input id="qaReplace" placeholder="Hi!" /></label>
+            <button id="qaRun">Run on content streams</button>
+          </div>
+        </details>
+
+        <!-- Text items (coalesced, compact) -->
+        <details id="textExplorer" open>
+          <summary>Text items (beta)</summary>
+          <div class="text-tools row" style="gap:8px;flex-wrap:wrap">
+            <button id="scanTextBtn">Scan text items</button>
+            <label>Filter: <input id="textFilter" placeholder="search…" /></label>
+            <label>Join ≤ <input id="xTol" type="number" value="4" min="0" step="0.5" style="width:70px" /> pt</label>
+            <label>Row y tol ≤ <input id="yTol" type="number" value="2" min="0" step="0.5" style="width:70px" /> pt</label>
+            <label>Step (pt): <input id="nudgeStep" type="number" value="1" min="0.25" step="0.25" style="width:80px" /></label>
+            <span id="scanStatus"></span>
+          </div>
+          <div id="textGroups" class="text-groups"></div>
+        </details>
+
+        <!-- NEW: Safe fields & metadata -->
+        <details id="safeExplorer" open>
+          <summary>Fields & Metadata (beta)</summary>
+          <div class="text-tools row" style="gap:8px;flex-wrap:wrap">
+            <button id="scanSafeBtn">Scan fields</button>
+            <label>Filter: <input id="safeFilter" placeholder="search…" /></label>
+            <span id="safeStatus"></span>
+          </div>
+          <div id="safeGroups" class="text-groups"></div>
+        </details>
+      </section>
+
+      <section class="right">
+        <h2>Preview</h2>
+        <div id="previewModeTabs" class="tabs">
+          <button data-tab="native" class="active">Built-in PDF viewer</button>
+          <button data-tab="canvas">Canvas (PDF.js) + overlay</button>
+        </div>
+
+        <div class="tab-panels">
+          <div id="panel-native" class="panel active">
+            <iframe id="pdfFrame" title="PDF preview"></iframe>
+          </div>
+          <div id="panel-canvas" class="panel">
+            <div id="canvasToolbar" class="row" hidden>
+              <button id="addText">Add text</button>
+              <button id="commitOverlay">Commit overlay as new content stream</button>
+              <label>Page: <input id="pageIndex" type="number" value="1" min="1" step="1" /></label>
+              <button id="renderPage">Render page</button>
+            </div>
+            <div class="canvasWrap">
+              <canvas id="pdfCanvas"></canvas>
+              <canvas id="overlayCanvas"></canvas>
+            </div>
+            <p class="note">Tip: overlay text boxes will be appended as a new content stream on the selected page using Helvetica.</p>
+          </div>
+        </div>
+      </section>
+    </main>
+
+    <script type="module" src="./main.js"></script>
+  </body>
+</html>
