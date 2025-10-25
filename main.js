@@ -1,4 +1,4 @@
-// --- tiny polyfill so pdfassembler’s CJS deps don’t choke in the browser
+// --- light polyfill so pdfassembler’s CJS deps don’t choke in workers/browsers
 if (typeof window !== 'undefined') {
   window.global = window.global || window;
   window.process = window.process || {
@@ -7,9 +7,7 @@ if (typeof window !== 'undefined') {
   };
 }
 
-import { PDFAssembler } from 'pdfassembler';
-
-// ---- pdf.js for canvas preview (kept separate from pdfassembler’s v2)
+// ---- pdf.js for canvas preview (kept separate from pdfassembler’s internal v2)
 let pdfjsLib = null;
 async function ensurePdfJs() {
   if (pdfjsLib) return pdfjsLib;
@@ -22,8 +20,8 @@ async function ensurePdfJs() {
 const $ = (sel) => document.querySelector(sel);
 const $$ = (sel) => Array.from(document.querySelectorAll(sel));
 
+/* ---------------- State ---------------- */
 let state = {
-  assembler: null,
   pdfTree: null,
   lastBlobUrl: null,
   lastUint8: null,
@@ -31,6 +29,15 @@ let state = {
   assembling: false
 };
 
+// --- FAST EDIT MODE knobs
+const ASSEMBLE_DEBOUNCE_MS = 350;
+const JSON_REFRESH_MS = 1200;
+let assembleTimer = null;
+let idleRehydrateTimer = null;
+const dirtyPages = new Set();
+let lastJsonRefresh = 0;
+
+/* ---------------- Elements ---------------- */
 const els = {
   fileInput: $('#fileInput'),
   loadSample: $('#loadSample'),
@@ -66,6 +73,20 @@ const els = {
   nudgeStep: $('#nudgeStep'),
   scanStatus: $('#scanStatus'),
   textGroups: $('#textGroups'),
+  // XObject/Image panel
+  scanXBtn: $('#scanXBtn'),
+  xobjFilter: $('#xobjFilter'),
+  xobjStatus: $('#xobjStatus'),
+  xobjGroups: $('#xobjGroups'),
+  xNudgeStep: $('#xNudgeStep'),
+  xScaleStep: $('#xScaleStep'),
+  // SVG/Paths/Tables (stubbed scan for now)
+  scanPathsBtn: $('#scanPathsBtn'),
+  pathFilter: $('#pathFilter'),
+  pathStatus: $('#pathStatus'),
+  pathGroups: $('#pathGroups'),
+  pNudgeStep: $('#pNudgeStep'),
+  pScaleStep: $('#pScaleStep'),
   // Safe panel
   scanSafeBtn: $('#scanSafeBtn'),
   safeFilter: $('#safeFilter'),
@@ -73,8 +94,90 @@ const els = {
   safeGroups: $('#safeGroups'),
 };
 
-wireUi();
 toast('Ready. Load a PDF to begin.');
+wireUi();
+
+/* ---------------- Workers & Pools ---------------- */
+
+// Simple RPC wrapper
+class RPCWorker {
+  constructor(url, { name = 'worker' } = {}) {
+    this.worker = new Worker(url, { type: 'module', name });
+    this._id = 1;
+    this._pending = new Map();
+    this.worker.onmessage = (e) => {
+      const { id, ok, result, error } = e.data || {};
+      if (!id) return;
+      const p = this._pending.get(id);
+      if (!p) return;
+      this._pending.delete(id);
+      if (ok) p.resolve(result);
+      else p.reject(new Error(error || 'Worker error'));
+    };
+    this.worker.onerror = (err) => {
+      for (const [, p] of this._pending) p.reject(err);
+      this._pending.clear();
+    };
+  }
+  call(type, payload, transfer = []) {
+    const id = this._id++;
+    const msg = { id, type, payload };
+    const prom = new Promise((resolve, reject) => this._pending.set(id, { resolve, reject }));
+    this.worker.postMessage(msg, transfer);
+    return prom;
+  }
+  terminate() { this.worker.terminate(); }
+}
+
+// Tiny worker pool for scanner tasks
+class ScannerPool {
+  constructor(concurrency = 2) {
+    this.workers = new Array(concurrency).fill(0).map((_, i) =>
+      new RPCWorker(new URL('./workers/scanner.worker.js', import.meta.url), { name: `scanner-${i}` })
+    );
+    this.q = [];
+    this.active = 0;
+  }
+  async _runOne(job) {
+    this.active++;
+    const w = this.workers[this.active % this.workers.length];
+    try {
+      const res = await w.call(job.type, job.payload);
+      job.resolve(res);
+    } catch (e) {
+      job.reject(e);
+    } finally {
+      this.active--;
+      this._pump();
+    }
+  }
+  _pump() {
+    while (this.active < this.workers.length && this.q.length) {
+      const job = this.q.shift();
+      this._runOne(job);
+    }
+  }
+  submit(type, payload) {
+    return new Promise((resolve, reject) => {
+      this.q.push({ type, payload, resolve, reject });
+      this._pump();
+    });
+  }
+  terminate() { this.workers.forEach(w => w.terminate()); }
+}
+
+// One assembler worker
+const assembler = new RPCWorker(new URL('./workers/assembler.worker.js', import.meta.url), { name: 'assembler' });
+// Two scanners by default
+const scanners = new ScannerPool(2);
+
+// optional render worker (OffscreenCanvas capable)
+let renderWorker = null;
+if (typeof OffscreenCanvas !== 'undefined' && self.crossOriginIsolated) {
+  renderWorker = new RPCWorker(new URL('./workers/render.worker.js', import.meta.url), { name: 'render' });
+}
+
+/* ---------------- UI wiring ---------------- */
 
 function wireUi() {
   els.tabs.addEventListener('click', (e) => {
@@ -112,20 +215,18 @@ function wireUi() {
     els.jsonEditor.value = stringifyPdfTree(state.pdfTree);
   });
 
-  els.indentToggle.addEventListener('change', () => {
-    if (state.assembler) state.assembler.indent = els.indentToggle.checked ? 2 : false;
-  });
-  els.compressToggle.addEventListener('change', () => {
-    if (state.assembler) state.assembler.compress = !!els.compressToggle.checked;
-  });
+  els.indentToggle.addEventListener('change', () => {});
+  els.compressToggle.addEventListener('change', () => {});
 
-  els.assembleBtn.addEventListener('click', () => autoAssembleAndRescan());
+  els.assembleBtn.addEventListener('click', () => forceAssembleAndFullRescan());
 
   els.removeRootBtn.addEventListener('click', async () => {
-    if (!state.assembler) return;
+    if (!state.pdfTree) return;
     try {
-      state.assembler.removeRootEntries(['/Outlines', '/PageLabels']);
-      els.jsonEditor.value = stringifyPdfTree(state.assembler.pdfTree);
+      const root = state.pdfTree['/Root'];
+      if (root) { delete root['/Outlines']; delete root['/PageLabels']; }
+      maybeRefreshJsonEditor(true);
+      scheduleAssemble({ reason: 'global' });
       toast('Removed /Outlines and /PageLabels from /Root (if present).');
     } catch (e) {
       console.error(e);
@@ -152,38 +253,53 @@ function wireUi() {
   els.xTol?.addEventListener('change', renderTextGroups);
   els.yTol?.addEventListener('change', renderTextGroups);
 
+  // XObject/Image panel
+  els.scanXBtn?.addEventListener('click', () => { if (!state.pdfTree) return toast('Load a PDF first.', true); scanXObjects(); });
+  els.xobjFilter?.addEventListener('input', () => renderXGroups());
+
+  // Paths panel (scan is stubbed for now)
+  els.scanPathsBtn?.addEventListener('click', () => { scanPaths(); });
+
   // Safe panel
   els.scanSafeBtn?.addEventListener('click', () => { if (!state.pdfTree) return toast('Load a PDF first.', true); scanSafeItems(); });
   els.safeFilter?.addEventListener('input', () => renderSafeGroups());
 }
 
+/* ---------------- Load / Assemble ---------------- */
+
 async function loadPdf(file) {
   resetPreview();
   toast('Loading…');
+
   try {
-    state.assembler = new PDFAssembler(file);
-    state.assembler.indent = els.indentToggle.checked ? 2 : false;
-    state.assembler.compress = !!els.compressToggle.checked;
+    // start in fast mode
+    els.compressToggle.checked = false;
+    els.indentToggle.checked = false;
 
-    const pdfTree = await state.assembler.getPDFStructure();
-    state.pdfTree = pdfTree;
+    const ab = await file.arrayBuffer();
+    const { treeJSON, pageCount } = await assembler.call('open', {
+      bytes: ab,
+      options: { compress: false, indent: false }
+    }, [ab]); // transfer
 
-    try {
-      state.pageCount = await state.assembler.countPages();
-      els.pageIndex.max = state.pageCount || 1;
-    } catch {}
+    state.pdfTree = JSON.parse(treeJSON);
+    state.pageCount = pageCount || 1;
+    els.pageIndex.max = state.pageCount;
 
-    els.jsonEditor.value = stringifyPdfTree(pdfTree);
+    maybeRefreshJsonEditor(true);
     els.assembleBtn.disabled = false;
     els.refreshPreviewBtn.disabled = false;
     els.syncFromTreeBtn.disabled = false;
     els.removeRootBtn.disabled = false;
     els.canvasModeBtn.disabled = false;
 
+    // show original PDF
     setFrameUrl(URL.createObjectURL(file));
     toast('PDF loaded.');
 
+    // initial scans (parallel)
     scanTextItems();
+    scanXObjects();
     scanSafeItems();
   } catch (e) {
     console.error(e);
@@ -195,72 +311,75 @@ function stringifyPdfTree(tree) {
   const seen = new WeakSet();
   return JSON.stringify(tree, function replacer(key, value) {
     if (typeof value === 'object' && value !== null) {
-      if (seen.has(value)) return { $ref: true }; // avoid cycles
+      if (seen.has(value)) return { $ref: true };
       seen.add(value);
     }
     return value;
-  }, 2);
+  }, els.indentToggle.checked ? 2 : 0);
+}
+
+function maybeRefreshJsonEditor(force=false){
+  const now = performance.now();
+  if (!force && (now - lastJsonRefresh) < JSON_REFRESH_MS) return;
+  lastJsonRefresh = now;
+  requestIdleCallback?.(() => {
+    els.jsonEditor.value = stringifyPdfTree(state.pdfTree);
+  }, { timeout: 800 }) || (els.jsonEditor.value = stringifyPdfTree(state.pdfTree));
 }
 
 async function applyJsonEditor(andAssemble=false) {
-  if (!state.assembler) return;
+  if (!state.pdfTree) return;
   try {
     const edited = JSON.parse(els.jsonEditor.value);
-    state.assembler.pdfTree = edited;
     state.pdfTree = edited;
-    if (andAssemble) await autoAssembleAndRescan();
+    if (andAssemble) await forceAssembleAndFullRescan();
   } catch (e) {
     console.error(e);
     toast('JSON parse failed. Fix errors and try again.', true);
   }
 }
 
-async function assembleAndPreview() {
-  if (!state.assembler) return;
-  toast('Assembling…');
-  const uint8 = await state.assembler.assemblePdf('Uint8Array');
-  state.lastUint8 = uint8;
-  const blob = new Blob([uint8], { type: 'application/pdf' });
-  const url = URL.createObjectURL(blob);
-  setFrameUrl(url);
-  els.downloadBtn.disabled = false;
-  els.downloadBtn.onclick = () => downloadBlob(blob, 'edited.pdf');
+function isNativeViewerActive() {
+  const btn = document.querySelector('.tabs button[data-tab="native"]');
+  return btn && btn.classList.contains('active');
+}
+
+async function assembleOnceReturnBytes() {
+  const treeJSON = stringifyPdfTree(state.pdfTree);
+  const compress = !!els.compressToggle.checked;
+  const indent = !!els.indentToggle.checked;
+  const { uint8 } = await assembler.call('assemble', { treeJSON, options: { compress, indent }});
+  return new Uint8Array(uint8); // copy of transferred buffer in main
+}
+
+async function assembleAndPreviewConditional() {
+  const bytes = await assembleOnceReturnBytes();
+  state.lastUint8 = bytes;
+
+  if (isNativeViewerActive()) {
+    const blob = new Blob([bytes], { type: 'application/pdf' });
+    const url = URL.createObjectURL(blob);
+    setFrameUrl(url);
+    els.downloadBtn.disabled = false;
+    els.downloadBtn.onclick = () => downloadBlob(blob, 'edited.pdf');
+  }
   toast('Assembled.');
 }
 
-// --- NEW: reconstruct assembler from the bytes we just built, then parse structure
-async function rehydrateTreeFromBytes() {
-  if (!state.lastUint8) return;
-  try {
-    const blob = new Blob([state.lastUint8], { type: 'application/pdf' });
-    const asm = new PDFAssembler(blob);
-    // reapply options so the next assemble matches UI toggles
-    asm.indent = els.indentToggle.checked ? 2 : false;
-    asm.compress = !!els.compressToggle.checked;
-
-    const fresh = await asm.getPDFStructure();
-    state.assembler = asm;
-    state.pdfTree = fresh;
-    els.jsonEditor.value = stringifyPdfTree(fresh);
-
-    try {
-      state.pageCount = await state.assembler.countPages();
-      els.pageIndex.max = state.pageCount || 1;
-    } catch {}
-  } catch (e) {
-    console.warn('rehydrate from bytes failed:', e);
-  }
+async function rehydrateFromBytes(bytes) {
+  const { treeJSON, pageCount } = await assembler.call('rehydrateFromBytes', { bytes }, [bytes.buffer]);
+  state.pdfTree = JSON.parse(treeJSON);
+  if (pageCount) { state.pageCount = pageCount; els.pageIndex.max = state.pageCount; }
 }
 
-// assemble → **recreate assembler from bytes** → rescan
-async function autoAssembleAndRescan() {
+async function forceAssembleAndFullRescan() {
   if (state.assembling) return;
   try {
     state.assembling = true;
-    await assembleAndPreview();
-    await rehydrateTreeFromBytes();   // << critical change
-    scanTextItems();
-    scanSafeItems();
+    await assembleAndPreviewConditional();
+    if (state.lastUint8) await rehydrateFromBytes(state.lastUint8);
+    await Promise.all([ scanTextItems(), scanXObjects(), scanSafeItems() ]);
+    maybeRefreshJsonEditor(true);
   } catch (e) {
     console.error(e);
     toast('Assemble/rescan failed. See console.', true);
@@ -269,6 +388,37 @@ async function autoAssembleAndRescan() {
   }
 }
 
+// Debounced incremental assemble + selective rescans
+function scheduleAssemble({ pageIndex = null, reason = 'text' } = {}) {
+  if (pageIndex != null) dirtyPages.add(pageIndex);
+  if (assembleTimer) clearTimeout(assembleTimer);
+
+  assembleTimer = setTimeout(async () => {
+    assembleTimer = null;
+    await assembleAndPreviewConditional();
+
+    // selective (use current in-memory tree)
+    const pages = [...dirtyPages];
+    dirtyPages.clear();
+    if (pages.length) { scanTextItems(pages); scanXObjects(pages); }
+    else { scanTextItems(); scanXObjects(); }
+
+    if (reason !== 'text') scanSafeItems();
+
+    // idle: truth-sync by reparse from bytes
+    if (idleRehydrateTimer) clearTimeout(idleRehydrateTimer);
+    idleRehydrateTimer = setTimeout(async () => {
+      if (state.lastUint8) {
+        await rehydrateFromBytes(state.lastUint8);
+        if (pages.length) { scanTextItems(pages); scanXObjects(pages); }
+        maybeRefreshJsonEditor(true);
+      }
+    }, 1200);
+  }, ASSEMBLE_DEBOUNCE_MS);
+}
+
+/* ---------------- Preview helpers ---------------- */
+
 function setFrameUrl(url) {
   if (state.lastBlobUrl) URL.revokeObjectURL(state.lastBlobUrl);
   state.lastBlobUrl = url;
@@ -276,8 +426,10 @@ function setFrameUrl(url) {
 }
 function downloadBlob(blob, name) { const a = document.createElement('a'); a.href = URL.createObjectURL(blob); a.download = name; document.body.appendChild(a); a.click(); a.remove(); }
 function toast(msg, error=false) { els.status.textContent = msg; els.status.style.color = error ? '#ffb0b0' : '#cce7ff'; if (!error) console.log(msg); }
+function resetPreview(){ if(state.lastBlobUrl) URL.revokeObjectURL(state.lastBlobUrl); state.lastBlobUrl=null; state.lastUint8=null; els.pdfFrame.removeAttribute('src'); }
 
-// ---------- Quick Action: regex replace ----------
+/* ---------------- Quick Action: regex replace ---------------- */
+
 function runRegexReplace() {
   if (!state.pdfTree) return;
   let find = els.qaFind.value ?? '';
@@ -310,12 +462,13 @@ function runRegexReplace() {
         }
       }
     }
-    els.jsonEditor.value = stringifyPdfTree(state.pdfTree);
-    autoAssembleAndRescan();
+    maybeRefreshJsonEditor(true);
+    scheduleAssemble({ reason: 'global' });
   } catch (e) { console.error(e); toast('Regex failed: ' + (e?.message || 'invalid pattern'), true); }
 }
 
-// ---------- Canvas Mode (pdf.js + overlay) ----------
+/* ---------------- Canvas (preview) ---------------- */
+
 function setupOverlayCanvases() {
   const wrap = document.querySelector('.canvasWrap');
   const rect = wrap.getBoundingClientRect();
@@ -323,27 +476,52 @@ function setupOverlayCanvases() {
   const ctx = els.overlayCanvas.getContext('2d'); ctx.lineWidth = 1; ctx.strokeStyle = '#66ccff';
 }
 async function renderCanvasPage() {
-  if (!state.lastUint8) await autoAssembleAndRescan();
-  await ensurePdfJs();
-  const data = state.lastUint8;
-  const pdf = await pdfjsLib.getDocument({ data }).promise;
-  const index1 = Math.min(Math.max(1, parseInt(els.pageIndex.value || '1', 10)), pdf.numPages);
-  els.pageIndex.value = index1;
-  const page = await pdf.getPage(index1);
-  const viewport = page.getViewport({ scale: 1.5 });
-  const canvas = els.pdfCanvas;
-  canvas.width = viewport.width; canvas.height = viewport.height;
-  const ctx = canvas.getContext('2d');
-  await page.render({ canvasContext: ctx, viewport }).promise;
-  els.overlayCanvas.width = canvas.width; els.overlayCanvas.height = canvas.height;
-  clearOverlay();
+  if (!state.lastUint8) scheduleAssemble({});
+  if (renderWorker && typeof OffscreenCanvas !== 'undefined' && self.crossOriginIsolated) {
+    // Off-thread render
+    const w = els.pdfCanvas.width = els.pdfCanvas.clientWidth || 1000;
+    const h = els.pdfCanvas.height = els.pdfCanvas.clientHeight || 1400;
+    const off = els.pdfCanvas.transferControlToOffscreen();
+    await renderWorker.call('render', {
+      bytes: state.lastUint8,
+      pageIndex: Math.max(1, parseInt(els.pageIndex.value || '1', 10)),
+      width: w
+    }, [off, state.lastUint8.buffer]);
+    // overlay stays main-thread
+    els.overlayCanvas.width = els.pdfCanvas.width; els.overlayCanvas.height = els.pdfCanvas.height;
+    clearOverlay();
+  } else {
+    // Fallback main-thread render
+    await ensurePdfJs();
+    const data = state.lastUint8;
+    const pdf = await pdfjsLib.getDocument({ data }).promise;
+    const index1 = Math.min(Math.max(1, parseInt(els.pageIndex.value || '1', 10)), pdf.numPages);
+    els.pageIndex.value = index1;
+    const page = await pdf.getPage(index1);
+    const viewport = page.getViewport({ scale: 1.5 });
+    const canvas = els.pdfCanvas;
+    canvas.width = viewport.width; canvas.height = viewport.height;
+    const ctx = canvas.getContext('2d');
+    await page.render({ canvasContext: ctx, viewport }).promise;
+    els.overlayCanvas.width = canvas.width; els.overlayCanvas.height = canvas.height;
+    clearOverlay();
+  }
 }
 function clearOverlay() { const octx = els.overlayCanvas.getContext('2d'); octx.clearRect(0,0,els.overlayCanvas.width, els.overlayCanvas.height); overlayItems.length = 0; }
 
 // Simple draggable overlay
 const overlayItems = []; let dragIndex = -1; let lastDrag=null;
 function addOverlayTextbox(){ overlayItems.push({ x:100, y:100, text:'New text' }); drawOverlay(); }
-function drawOverlay(){ const ctx=els.overlayCanvas.getContext('2d'); ctx.clearRect(0,0,els.overlayCanvas.width,els.overlayCanvas.height); ctx.font='16px sans-serif'; ctx.fillStyle='#ffffff'; ctx.strokeStyle='#66ccff'; overlayItems.forEach(it=>{ ctx.fillText(it.text,it.x,it.y); const m=ctx.measureText(it.text).width+8,h=22; ctx.strokeRect(it.x-4,it.y-16,w,h); }); }
+function drawOverlay(){
+  const ctx=els.overlayCanvas.getContext('2d');
+  ctx.clearRect(0,0,els.overlayCanvas.width,els.overlayCanvas.height);
+  ctx.font='16px sans-serif'; ctx.fillStyle='#ffffff'; ctx.strokeStyle='#66ccff';
+  overlayItems.forEach(it=>{
+    ctx.fillText(it.text,it.x,it.y);
+    const w=ctx.measureText(it.text).width+8, h=22;
+    ctx.strokeRect(it.x-4,it.y-16,w,h);
+  });
+}
 els.overlayCanvas.addEventListener('mousedown',e=>{ const {x,y}=overlayPos(e); const i=hitIndex(x,y); dragIndex=i; lastDrag={x,y}; });
 els.overlayCanvas.addEventListener('mousemove',e=>{ if(dragIndex<0) return; const {x,y}=overlayPos(e); const dx=x-lastDrag.x,dy=y-lastDrag.y; overlayItems[dragIndex].x+=dx; overlayItems[dragIndex].y+=dy; lastDrag={x,y}; drawOverlay(); });
 ['mouseup','mouseleave'].forEach(ev=>els.overlayCanvas.addEventListener(ev,()=>dragIndex=-1));
@@ -351,169 +529,29 @@ els.overlayCanvas.addEventListener('dblclick',e=>{ const {x,y}=overlayPos(e); co
 function overlayPos(e){ const r=els.overlayCanvas.getBoundingClientRect(); return {x:e.clientX-r.left,y:e.clientY-r.top}; }
 function hitIndex(x,y){ const ctx=els.overlayCanvas.getContext('2d'); ctx.font='16px sans-serif'; for(let i=overlayItems.length-1;i>=0;i--){ const it=overlayItems[i]; const w=ctx.measureText(it.text).width+8,h=22; if(x>=it.x-4&&x<=it.x-4+w&&y>=it.y-16&&y<=it.y-16+h) return i;} return -1; }
 
-// ----------------------- Text items (Tj + TJ) ------------------------
+/* ---------------- Text scanning & editing (uses scanner pool) ---------------- */
 
-// escape/unescape for PDF literal strings
-function pdfEscapeLiteral(s){ return String(s).replace(/([()\\])/g,'\\$1'); }
-function pdfUnescapeLiteral(s){ return String(s).replace(/\\\\/g,'\u0000').replace(/\\\)/g,')').replace(/\\\(/g,'(').replace(/\u0000/g,'\\'); }
-// last match before index
-function lastMatchBefore(regex, text, pos){ let m,last=null; const re=new RegExp(regex.source, regex.flags.includes('g')?regex.flags:regex.flags+'g'); while((m=re.exec(text)) && m.index<pos) last=m; return last; }
+let TEXT_GROUPS = []; // [{pageIndex, items:[...]}]
 
-// token model for one text drawing op
-// { kind:'Tj'|'TJ', tokStart, tokEnd, text, segs:[{start,end,text}] }
-function scanTokensTj(src) {
-  const out = [];
-  const re = /\((?:\\.|[^\\()])*\)\s*Tj/g;
-  let m;
-  while ((m = re.exec(src))) {
-    const start = m.index;
-    const end   = re.lastIndex;
-    const mm = /^\(((?:\\.|[^\\()])*)\)\s*Tj$/.exec(m[0]);
-    if (!mm) continue;
-    out.push({
-      kind: 'Tj',
-      tokStart: start,
-      tokEnd: end,
-      text: pdfUnescapeLiteral(mm[1]),
-      segs: [{ start, end, text: pdfUnescapeLiteral(mm[1]) }]
-    });
-  }
-  return out;
-}
-
-function isWs(ch){ return ch===' '||ch==='\n'||ch==='\r'||ch==='\t'||ch==='\f'||ch==='\v'; }
-function readNumber(src,i){
-  const m = /^-?\d+(?:\.\d+)?/.exec(src.slice(i));
-  if (!m) return null;
-  return { num: parseFloat(m[0]), end: i+m[0].length };
-}
-function readPdfString(src,i){
-  if (src[i] !== '(') return null;
-  let j=i+1, depth=1, out='';
-  while (j < src.length && depth>0) {
-    const ch = src[j];
-    if (ch === '\\') {
-      const nxt = src[j+1];
-      if (nxt === '(' || nxt === ')' || nxt === '\\') { out += nxt; j+=2; continue; }
-      if (nxt === 'n'){ out+='\n'; j+=2; continue; }
-      if (nxt === 'r'){ out+='\r'; j+=2; continue; }
-      if (nxt === 't'){ out+='\t'; j+=2; continue; }
-      if (nxt === 'b'||nxt==='f'){ j+=2; continue; }
-      const oct = /^\\([0-7]{1,3})/.exec(src.slice(j));
-      if (oct){ out += String.fromCharCode(parseInt(oct[1],8)); j += 1 + oct[1].length; continue; }
-      out += nxt; j+=2; continue;
-    } else if (ch === '('){ depth++; out+='('; j++; }
-    else if (ch === ')'){ depth--; if (depth===0){ j++; break; } out+=')'; j++; }
-    else { out += ch; j++; }
-  }
-  return { text: out, end: j };
-}
-// Read [ ... ] TJ allowing whitespace/newlines between ']' and 'TJ'
-function scanTokensTJ(src){
-  const out = [];
-  for (let i=0;i<src.length;i++){
-    if (src[i] !== '[') continue;
-    let j = i+1, segs = [];
-    while (j < src.length) {
-      while (j<src.length && isWs(src[j])) j++;
-      if (src[j] === '(') {
-        const s = readPdfString(src, j);
-        if (!s) break;
-        segs.push({ start: j, end: s.end, text: s.text });
-        j = s.end;
-      } else if (src[j] === ']') {
-        j++;
-        let k=j; while (k<src.length && isWs(src[k])) k++;
-        if (src.slice(k, k+2) === 'TJ') {
-          out.push({ kind:'TJ', tokStart:i, tokEnd:k+2, text: segs.map(s=>s.text).join(''), segs });
-        }
-        i = j;
-        break;
-      } else {
-        const num = readNumber(src, j);
-        if (num) { j = num.end; } else { break; }
-      }
-    }
-  }
-  return out;
-}
-
-// live model
-let TEXT_GROUPS = []; // [{pageIndex, items:[GroupItem]}]
-/*
-GroupItem {
-  id, pageIndex, streamIndex, objRef,
-  start, end, text, posType, x, y, posIndex, fontName, fontSize,
-  segments: [{start,end,text}]
-}
-*/
-
-function scanTextItems(){
-  TEXT_GROUPS = [];
+async function scanTextItems(onlyPages = null){
+  if (!state.pdfTree) return;
   const kids = state.pdfTree?.['/Root']?.['/Pages']?.['/Kids'];
-  if(!Array.isArray(kids)){ toast('No /Pages./Kids found.', true); renderTextGroups(); return; }
+  const allPages = Array.isArray(kids) ? kids.map((_,i)=>i) : [];
+  const pages = Array.isArray(onlyPages) && onlyPages.length ? onlyPages : allPages;
 
-  kids.forEach((page, pIndex) => {
-    const contents = page?.['/Contents']; if(!contents) return;
-    const streams = Array.isArray(contents) ? contents : [contents];
-    const groupsForPage = [];
+  const treeJSON = stringifyPdfTree(state.pdfTree);
+  const xTol = Number(els.xTol?.value || 4);
+  const yTol = Number(els.yTol?.value || 2);
 
-    streams.forEach((obj, sIndex) => {
-      if (!obj || typeof obj !== 'object' || typeof obj.stream !== 'string') return;
-      const src = obj.stream;
+  const jobs = pages.map(p => scanners.submit('scanText', { treeJSON, pageIndex: p, xTol, yTol }));
+  const results = await Promise.all(jobs);
 
-      const toks = [...scanTokensTj(src), ...scanTokensTJ(src)];
-      toks.sort((a,b)=>a.tokStart-b.tokStart);
-
-      const items = toks.map(t => {
-        const tm = lastMatchBefore(/(-?\d+(?:\.\d+)?)\s+(-?\d+(?:\.\d+)?)\s+(-?\d+(?:\.\d+)?)\s+(-?\d+(?:\.\d+)?)\s+(-?\d+(?:\.\d+)?)\s+(-?\d+(?:\.\d+)?)\s+Tm/g, src, t.tokStart);
-        const td = lastMatchBefore(/(-?\d+(?:\.\d+)?)\s+(-?\d+(?:\.\d+)?)\s+Td/g, src, t.tokStart);
-        const tf = lastMatchBefore(/\/([^\s]+)\s+(-?\d+(?:\.\d+)?)\s+Tf/g, src, t.tokStart);
-        let posType=null,x=NaN,y=NaN,posMatch=null;
-        if (tm && (!td || tm.index > td.index)) { posType='Tm'; x=Number(tm[5]); y=Number(tm[6]); posMatch=tm; }
-        else if (td) { posType='Td'; x=Number(td[1]); y=Number(td[2]); posMatch=td; }
-        return {
-          pageIndex:pIndex, streamIndex:sIndex, objRef:obj,
-          start:t.tokStart, end:t.tokEnd,
-          text:t.text, posType, x, y, posIndex: posMatch ? posMatch.index : null,
-          fontName: tf?tf[1]:null, fontSize: tf?Number(tf[2]):null,
-          segments: t.segs
-        };
-      });
-
-      // coalesce adjacent items on same row and near X
-      const xTol = Number(els.xTol?.value || 4);
-      const yTol = Number(els.yTol?.value || 2);
-      let run = null;
-      function flushRun(){
-        if(!run) return;
-        const first = run[0], last = run[run.length-1];
-        groupsForPage.push({
-          id: `p${pIndex}s${sIndex}o${first.start}`,
-          pageIndex:pIndex, streamIndex:sIndex, objRef:first.objRef,
-          start:first.start, end:last.end,
-          text: run.map(r=>r.text).join(''),
-          posType:first.posType, x:first.x, y:first.y, posIndex:first.posIndex,
-          fontName:first.fontName, fontSize:first.fontSize,
-          segments: run.flatMap(r=>r.segments)
-        });
-        run=null;
-      }
-      for (const it of items){
-        if (!run){ run=[it]; continue; }
-        const prev = run[run.length-1];
-        const sameRow = Number.isFinite(it.y) && Number.isFinite(prev.y) ? Math.abs(it.y - prev.y) <= yTol : true;
-        const closeX  = (Number.isFinite(it.x) && Number.isFinite(prev.x)) ? (it.x - prev.x) <= xTol : true;
-        if (it.streamIndex === prev.streamIndex && sameRow && closeX) run.push(it);
-        else { flushRun(); run=[it]; }
-      }
-      flushRun();
-    });
-
-    groupsForPage.sort((a,b)=> (b.y ?? 0) - (a.y ?? 0));
-    TEXT_GROUPS.push({ pageIndex:pIndex, items: groupsForPage });
-  });
-
+  const maxPage = (kids?.length || 0) - 1;
+  const pageMap = new Map(results.map(r => [r.pageIndex, r]));
+  TEXT_GROUPS = [];
+  for (let i=0;i<=maxPage;i++){
+    TEXT_GROUPS.push(pageMap.get(i) || { pageIndex:i, items:[] });
+  }
   renderTextGroups();
 }
 
@@ -547,7 +585,7 @@ function renderTextItem(it, step){
         <span class="badge">p${it.pageIndex+1}</span>
         <span class="badge">${it.posType || '?'}</span>
         <span class="badge">x:${fmtNum(it.x)} y:${fmtNum(it.y)}</span>
-        ${it.fontSize? `<span class="badge">size:${fmtNum(it.fontSize)}</span>`:''}
+        ${Number.isFinite(it.fontSize)? `<span class="badge">size:${fmtNum(it.fontSize)}</span>`:''}
       </span>
     </summary>
     <div class="edit">
@@ -558,7 +596,7 @@ function renderTextItem(it, step){
         <span style="opacity:.7;font-size:12px">(Tm/Td)</span>
       </div>
       <div class="font-mini">
-        <label>Size: <input class="ti-fs" type="number" step="0.5" value="${it.fontSize ?? ''}"></label>
+        <label>Size: <input class="ti-fs" type="number" step="0.5" value="${Number.isFinite(it.fontSize)? it.fontSize : ''}"></label>
         <button class="ti-applyfs" title="Apply font size">Set</button>
       </div>
       <div class="nudges">
@@ -588,8 +626,7 @@ function renderTextItem(it, step){
   return d;
 }
 
-function getObjRef(it){
-  if (it?.objRef && typeof it.objRef.stream === 'string') return it.objRef;
+function getObjRefForText(it){
   const page = state.pdfTree?.['/Root']?.['/Pages']?.['/Kids']?.[it.pageIndex];
   const contents = page?.['/Contents'];
   const streams = Array.isArray(contents) ? contents : [contents];
@@ -599,7 +636,7 @@ function getObjRef(it){
 
 // Replace group with safe single token; re-find locally if needed
 async function replaceGroupText(it, newText){
-  const obj = getObjRef(it); if(!obj) return toast('Stream not found.', true);
+  const obj = getObjRefForText(it); if(!obj) return toast('Stream not found.', true);
   const s = obj.stream;
   const replacement = `[(${pdfEscapeLiteral(newText)})] TJ`;
 
@@ -607,37 +644,41 @@ async function replaceGroupText(it, newText){
   if (slice.length && s.indexOf(slice, Math.max(0, it.start - 4)) >= 0) {
     obj.stream = s.slice(0, it.start) + replacement + s.slice(it.end);
   } else {
-    const winStart = Math.max(0, it.start - 400);
-    const winEnd   = Math.min(s.length, it.end + 400);
-    const win = s.slice(winStart, winEnd);
-    const local = (() => {
-      const i = win.lastIndexOf('[', it.start - winStart);
-      let j = -1;
-      if (i >= 0) {
-        const close = win.indexOf(']', i + 1);
-        if (close > i) {
-          let k = close + 1; while (k < win.length && isWs(win[k])) k++;
-          if (win.slice(k, k + 2) === 'TJ') j = k + 2;
-        }
-      }
-      if (i >= 0 && j > i) return { a: winStart + i, b: winStart + j };
-      const k = win.lastIndexOf('(', it.start - winStart);
-      const l = win.indexOf(') Tj', Math.max(k + 1, 0));
-      if (k >= 0 && l > k) return { a: winStart + k, b: winStart + l + 3 };
-      return null;
-    })();
+    const local = localReFindStreamToken(s, it.start, it.end);
     if (!local) return toast('Could not locate token to replace.', true);
     obj.stream = s.slice(0, local.a) + replacement + s.slice(local.b);
   }
 
   it.text = newText;
-  els.jsonEditor.value = stringifyPdfTree(state.pdfTree);
-  await autoAssembleAndRescan();
+  maybeRefreshJsonEditor(true);
+  scheduleAssemble({ pageIndex: it.pageIndex, reason: 'text' });
+}
+
+function localReFindStreamToken(s, start, end){
+  const isWs = ch => ch===' '||ch==='\n'||ch==='\r'||ch==='\t'||ch==='\f'||ch==='\v';
+  const winStart = Math.max(0, start - 400);
+  const winEnd   = Math.min(s.length, end + 400);
+  const win = s.slice(winStart, winEnd);
+  const relStart = start - winStart;
+  const i = win.lastIndexOf('[', relStart);
+  let j = -1;
+  if (i >= 0) {
+    const close = win.indexOf(']', i + 1);
+    if (close > i) {
+      let k = close + 1; while (k < win.length && isWs(win[k])) k++;
+      if (win.slice(k, k + 2) === 'TJ') j = k + 2;
+    }
+  }
+  if (i >= 0 && j > i) return { a: winStart + i, b: winStart + j };
+  const k = win.lastIndexOf('(', relStart);
+  const l = win.indexOf(') Tj', Math.max(k + 1, 0));
+  if (k >= 0 && l > k) return { a: winStart + k, b: winStart + l + 3 };
+  return null;
 }
 
 async function nudgeItem(it, dx, dy){
   if (!it.posType || it.posIndex == null) return toast('No position operator near this text; cannot nudge.', true);
-  const obj = getObjRef(it); if(!obj) return toast('Stream not found.', true);
+  const obj = getObjRefForText(it); if(!obj) return toast('Stream not found.', true);
   const s = obj.stream;
 
   if (it.posType === 'Td') {
@@ -653,13 +694,13 @@ async function nudgeItem(it, dx, dy){
     obj.stream = s.slice(0, it.posIndex) + `${m[1]} ${m[2]} ${m[3]} ${m[4]} ${e} ${f} Tm` + s.slice(it.posIndex + m[0].length);
     it.x = e; it.y = f;
   }
-  els.jsonEditor.value = stringifyPdfTree(state.pdfTree);
-  await autoAssembleAndRescan();
+  maybeRefreshJsonEditor(true);
+  scheduleAssemble({ pageIndex: it.pageIndex, reason: 'text' });
 }
 async function setItemXY(it, x, y){ const dx = Number.isFinite(x)&&Number.isFinite(it.x)?(x-it.x):0; const dy = Number.isFinite(y)&&Number.isFinite(it.y)?(y-it.y):0; if (!dx && !dy) return; await nudgeItem(it, dx, dy); }
 
 async function applyFontSize(it, size){
-  const obj = getObjRef(it); if(!obj) return toast('Stream not found.', true);
+  const obj = getObjRefForText(it); if(!obj) return toast('Stream not found.', true);
   const s = obj.stream;
   const tf = lastMatchBefore(/\/([^\s]+)\s+(-?\d+(?:\.\d+)?)\s+Tf/g, s, it.start);
   if (tf) {
@@ -669,18 +710,153 @@ async function applyFontSize(it, size){
     obj.stream = s.slice(0, it.start) + `/Helv ${size} Tf ` + s.slice(it.start);
     it.fontSize = size;
   }
-  els.jsonEditor.value = stringifyPdfTree(state.pdfTree);
-  await autoAssembleAndRescan();
+  maybeRefreshJsonEditor(true);
+  scheduleAssemble({ pageIndex: it.pageIndex, reason: 'text' });
 }
 
-// ---------------------- Fields & Metadata (beta) -------------------------
+/* ---------------- XObjects / Images (scan in workers, edit here) ---------------- */
 
-let SAFE_GROUPS = []; // array of {title, items:[{kind, label, get(), set(newVal), preview()}]}
+let XOBJ_GROUPS = []; // [{pageIndex, items:[...]}]
+
+async function scanXObjects(onlyPages = null){
+  if (!state.pdfTree) return;
+  const kids = state.pdfTree?.['/Root']?.['/Pages']?.['/Kids'];
+  const allPages = Array.isArray(kids) ? kids.map((_,i)=>i) : [];
+  const pages = Array.isArray(onlyPages) && onlyPages.length ? onlyPages : allPages;
+
+  const treeJSON = stringifyPdfTree(state.pdfTree);
+  const jobs = pages.map(p => scanners.submit('scanXObjects', { treeJSON, pageIndex: p }));
+  const results = await Promise.all(jobs);
+
+  const maxPage = (kids?.length || 0) - 1;
+  const pageMap = new Map(results.map(r => [r.pageIndex, r]));
+  XOBJ_GROUPS = [];
+  for (let i=0;i<=maxPage;i++){
+    XOBJ_GROUPS.push(pageMap.get(i) || { pageIndex:i, items:[] });
+  }
+  renderXGroups();
+}
+
+function renderXGroups(){
+  const wrap = els.xobjGroups; if (!wrap) return;
+  const filter = (els.xobjFilter?.value || '').toLowerCase();
+  const step   = Number(els.xNudgeStep?.value || 1);
+  const sStep  = Number(els.xScaleStep?.value || 0.05);
+  wrap.innerHTML = '';
+
+  let total = 0;
+  XOBJ_GROUPS.forEach(group=>{
+    const visible = group.items.filter(it => {
+      const label = `${it.name} ${it.kind}`.toLowerCase();
+      return !filter || label.includes(filter);
+    });
+    total += visible.length;
+    const box = document.createElement('div');
+    box.className = 'text-group';
+    box.innerHTML = `<h3>Page ${group.pageIndex+1} — ${visible.length} XObject draw(s)</h3>`;
+    visible.forEach(it => box.appendChild(renderXItem(it, step, sStep)));
+    wrap.appendChild(box);
+  });
+  if (els.xobjStatus) els.xobjStatus.textContent = `${total} XObject draw(s).`;
+}
+
+function renderXItem(it, step, sStep){
+  const d = document.createElement('details');
+  d.className = 'text-item';
+  const axisAligned = Math.abs(it.b) < 1e-6 && Math.abs(it.c) < 1e-6;
+  d.innerHTML = `
+    <summary>
+      <span class="ellipsis">/${escapeHtml(it.name)} <small>(${it.kind})</small></span>
+      <span class="meta">
+        <span class="badge">p${it.pageIndex+1}</span>
+        <span class="badge">${it.hasCM ? 'cm' : 'no cm'}</span>
+        <span class="badge">x:${fmtNum(it.e)} y:${fmtNum(it.f)}</span>
+        ${axisAligned ? `<span class="badge">sx:${fmtNum(it.a)} sy:${fmtNum(it.d)}</span>` : `<span class="badge">matrix</span>`}
+      </span>
+    </summary>
+    <div class="edit">
+      <div class="text-xy">
+        <label>X: <input class="xo-x" type="number" step="0.5" value="${numOrEmpty(it.e)}"></label>
+        <label>Y: <input class="xo-y" type="number" step="0.5" value="${numOrEmpty(it.f)}"></label>
+        <span style="opacity:.7;font-size:12px">(cm tx/ty)</span>
+      </div>
+      <div class="font-mini">
+        <label>sX: <input class="xo-sx" type="number" step="0.01" value="${it.a}"></label>
+        <label>sY: <input class="xo-sy" type="number" step="0.01" value="${it.d}"></label>
+        <button class="xo-apply" title="Apply matrix">Apply</button>
+      </div>
+      <div class="nudges">
+        <button class="nL">←</button>
+        <button class="nU">↑</button>
+        <button class="nD">↓</button>
+        <button class="nR">→</button>
+        <button class="sDown">– size</button>
+        <button class="sUp">+ size</button>
+        <button class="reset">reset cm</button>
+      </div>
+    </div>
+  `;
+
+  const q = sel => d.querySelector(sel);
+  q('.nL').onclick = async () => { await xNudge(it, -step, 0); };
+  q('.nR').onclick = async () => { await xNudge(it, +step, 0); };
+  q('.nU').onclick = async () => { await xNudge(it, 0, +step); };
+  q('.nD').onclick = async () => { await xNudge(it, 0, -step); };
+  q('.sUp').onclick = async () => { await xScale(it, 1+sStep, 1+sStep); };
+  q('.sDown').onclick = async () => { await xScale(it, 1/(1+sStep), 1/(1+sStep)); };
+  q('.reset').onclick = async () => { await xApplyMatrix(it, 1,0,0,1,0,0); };
+
+  q('.xo-apply').onclick = async () => {
+    const sx = Number(q('.xo-sx').value); const sy = Number(q('.xo-sy').value);
+    const tx = Number(q('.xo-x').value);  const ty = Number(q('.xo-y').value);
+    if (![sx,sy,tx,ty].every(Number.isFinite)) return toast('Enter valid numbers', true);
+    await xApplyMatrix(it, sx, 0, 0, sy, tx, ty);
+  };
+  q('.xo-x').onchange = async () => { const tx = Number(q('.xo-x').value); if(Number.isFinite(tx)) await xApplyMatrix(it, it.a,it.b,it.c,it.d,tx,it.f); };
+  q('.xo-y').onchange = async () => { const ty = Number(q('.xo-y').value); if(Number.isFinite(ty)) await xApplyMatrix(it, it.a,it.b,it.c,it.d,it.e,ty); };
+
+  return d;
+}
+
+function getStreamForX(it){
+  const page = state.pdfTree?.['/Root']?.['/Pages']?.['/Kids']?.[it.pageIndex];
+  const contents = page?.['/Contents']; const streams = Array.isArray(contents) ? contents : [contents];
+  const obj = streams[it.streamIndex];
+  return (obj && typeof obj.stream === 'string') ? obj : null;
+}
+function fmt(n){ return (Math.round(n*10000)/10000).toString(); }
+
+async function xApplyMatrix(it, a,b,c,d,e,f){
+  const obj = getStreamForX(it); if(!obj) return toast('Stream not found.', true);
+  const s = obj.stream;
+  const token = `${fmt(a)} ${fmt(b)} ${fmt(c)} ${fmt(d)} ${fmt(e)} ${fmt(f)} cm`;
+
+  if (it.hasCM && it.cmIndex != null && typeof it.cmText === 'string') {
+    obj.stream = s.slice(0, it.cmIndex) + token + s.slice(it.cmIndex + it.cmText.length);
+  } else {
+    obj.stream = s.slice(0, it.doStart) + token + ' ' + s.slice(it.doStart);
+  }
+
+  it.hasCM = true; it.cmText = token; it.a=a; it.b=b; it.c=c; it.d=d; it.e=e; it.f=f;
+  maybeRefreshJsonEditor(true);
+  scheduleAssemble({ pageIndex: it.pageIndex, reason: 'text' });
+}
+async function xNudge(it, dx, dy){ await xApplyMatrix(it, it.a, it.b, it.c, it.d, it.e + dx, it.f + dy); }
+async function xScale(it, sx, sy){ await xApplyMatrix(it, it.a * sx, it.b, it.c, it.d * sy, it.e, it.f); }
+
+/* ---------------- (Stub) Paths panel ---------------- */
+async function scanPaths(onlyPages = null){
+  if (els.pathStatus) els.pathStatus.textContent = 'Vector scan: not implemented in worker yet.';
+  if (els.pathGroups) els.pathGroups.innerHTML = '';
+}
+
+/* ---------------- Safe items (stays in main) ---------------- */
+
+let SAFE_GROUPS = [];
 
 function scanSafeItems(){
   SAFE_GROUPS = [];
 
-  // Document Info dictionary
   const info = state.pdfTree?.['/Info'];
   if (info && typeof info === 'object') {
     const items = [];
@@ -694,7 +870,6 @@ function scanSafeItems(){
     if (items.length) SAFE_GROUPS.push({ title: 'Document Info', items });
   }
 
-  // AcroForm text fields (/V as string)
   const fields = state.pdfTree?.['/Root']?.['/AcroForm']?.['/Fields'];
   if (Array.isArray(fields)) {
     const items = [];
@@ -708,7 +883,6 @@ function scanSafeItems(){
     if (items.length) SAFE_GROUPS.push({ title: 'Form fields (/V)', items });
   }
 
-  // Per-page rotation
   const kids = state.pdfTree?.['/Root']?.['/Pages']?.['/Kids'];
   if (Array.isArray(kids)) {
     const items = [];
@@ -720,7 +894,6 @@ function scanSafeItems(){
     if (items.length) SAFE_GROUPS.push({ title: 'Page rotation', items });
   }
 
-  // Annotation texts (/Contents)
   if (Array.isArray(kids)) {
     const items = [];
     kids.forEach((p, i) => {
@@ -789,8 +962,8 @@ function renderSafeGroups(){
         const nv = d.querySelector('.sv').value;
         try {
           it.setter(nv);
-          els.jsonEditor.value = stringifyPdfTree(state.pdfTree);
-          await autoAssembleAndRescan();
+          maybeRefreshJsonEditor(true);
+          scheduleAssemble({ reason: 'global' });
         } catch (e) { console.error(e); toast('Failed to set value', true); }
       };
       box.appendChild(d);
@@ -802,9 +975,10 @@ function renderSafeGroups(){
   if (els.safeStatus) els.safeStatus.textContent = `${total} editable item(s).`;
 }
 
-// -------------------- helpers --------------------
+/* ---------------- Misc helpers ---------------- */
 function escapeHtml(s){ return String(s).replace(/[&<>"']/g, c => ({'&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot;',"'":'&#39;'}[c])); }
 function escapeAttr(s){ return escapeHtml(s); }
 function fmtNum(v){ return Number.isFinite(v)? (Math.round(v*100)/100) : '—'; }
 function numOrEmpty(v){ return Number.isFinite(v)? v : ''; }
-function resetPreview(){ if(state.lastBlobUrl) URL.revokeObjectURL(state.lastBlobUrl); state.lastBlobUrl=null; state.lastUint8=null; els.pdfFrame.removeAttribute('src'); }
+function pdfEscapeLiteral(s){ return String(s).replace(/([()\\])/g,'\\$1'); }
+function lastMatchBefore(regex, text, pos){ let m,last=null; const re=new RegExp(regex.source, regex.flags.includes('g')?regex.flags:regex.flags+'g'); while((m=re.exec(text)) && m.index<pos) last=m; return last; }
