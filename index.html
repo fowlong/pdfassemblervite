@@ -1,102 +1,211 @@
 <!doctype html>
 <html lang="en">
-  <head>
-    <meta charset="UTF-8" />
-    <meta name="viewport" content="width=device-width, initial-scale=1.0" />
-    <title>PDFAssembler – Vite Browser PDF Editor</title>
-    <link rel="stylesheet" href="./style.css" />
-  </head>
-  <body>
-    <header>
-      <h1>PDFAssembler – Vite Browser PDF Editor</h1>
-      <div class="row">
-        <label class="file">
-          <input id="fileInput" type="file" accept="application/pdf" />
-          <span>Select PDF…</span>
-        </label>
-        <button id="loadSample">Load sample</button>
-        <button id="assembleBtn" disabled>Assemble & Preview</button>
-        <button id="downloadBtn" disabled>Download</button>
-        <label><input type="checkbox" id="indentToggle" /> indent output</label>
-        <label><input type="checkbox" id="compressToggle" checked /> compress streams</label>
-        <button id="removeRootBtn" disabled>Remove /Outlines & /PageLabels</button>
-        <button id="canvasModeBtn" disabled>Canvas Mode (overlay)</button>
-        <span id="status"></span>
+<head>
+  <meta charset="utf-8" />
+  <title>pdfassembler — Visual PDF Editor</title>
+  <meta name="viewport" content="width=device-width, initial-scale=1" />
+  <!-- your styles -->
+  <link rel="stylesheet" href="./style.css" />
+  <style>
+    /* minimal safety if style.css is missing */
+    body{margin:0;font-family:system-ui,Segoe UI,Roboto,Helvetica,Arial,sans-serif;background:#0f1220;color:#e8eeff}
+    header{display:flex;gap:.75rem;align-items:center;padding:.75rem 1rem;border-bottom:1px solid #2a2e47;background:#121530;position:sticky;top:0;z-index:10}
+    header h1{font-size:16px;margin:0;color:#9fd3ff;font-weight:600;white-space:nowrap}
+    header .sp{flex:1}
+    header .row{display:flex;flex-wrap:wrap;gap:.5rem;align-items:center}
+    button,input,select,textarea{background:#15183a;color:#e8eeff;border:1px solid #2a2e47;border-radius:6px;padding:.4rem .6rem}
+    button:hover{background:#1a1e46}
+    .layout{display:grid;grid-template-columns: 1.1fr .9fr; gap:12px; padding:12px}
+    .card{background:#111433;border:1px solid #2a2e47;border-radius:10px;overflow:hidden}
+    .card .head{display:flex;align-items:center;gap:.5rem;padding:.6rem .8rem;border-bottom:1px solid #2a2e47;background:#121538}
+    .card .head h2{font-size:14px;margin:0;color:#bcd9ff}
+    .card .body{padding:.8rem}
+    .toolbar{display:flex;gap:.5rem;flex-wrap:wrap;align-items:center}
+    .status{font-size:12px;opacity:.85}
+    .tabs{display:flex;gap:4px}
+    .tabs button{padding:.35rem .6rem;border-radius:8px;border:1px solid #2a2e47;background:#161a3b}
+    .tabs button.active{background:#20306b;border-color:#3850a3}
+    .panel{display:none}
+    .panel.active{display:block}
+    iframe{width:100%;height:70vh;border:0;background:#0b0e24}
+    .canvasWrap{position:relative}
+    canvas{display:block;max-width:100%;background:#0b0e24;border:1px solid #2a2e47;border-radius:8px}
+    .overlay{position:absolute;left:0;top:0;pointer-events:auto}
+    .grid2{display:grid;grid-template-columns: 1fr 1fr; gap:.6rem}
+    .mono{font-family: ui-monospace,SFMono-Regular,Menlo,Consolas,monospace}
+    .small{font-size:12px}
+    .text-group{border:1px solid #273059;border-radius:8px;margin:.5rem 0;overflow:hidden}
+    .text-group > h3{margin:0;padding:.45rem .6rem;font-size:12px;background:#12173b;border-bottom:1px solid #273059;color:#b4cbff}
+    details.text-item{border-top:1px solid #273059}
+    details.text-item:first-of-type{border-top:0}
+    details.text-item > summary{list-style:none;cursor:pointer;padding:.5rem .6rem;display:flex;justify-content:space-between;gap:.5rem}
+    .ellipsis{white-space:nowrap;overflow:hidden;text-overflow:ellipsis;max-width:55%}
+    .meta{display:flex;gap:.35rem;align-items:center}
+    .badge{font-size:11px;padding:.1rem .35rem;border-radius:5px;background:#1a214a;border:1px solid #2a356c;color:#bcd9ff}
+    details.text-item .edit{padding:.5rem .6rem;border-top:1px dashed #273059;display:grid;gap:.5rem}
+    .text-xy,.font-mini,.nudges{display:flex;gap:.4rem;flex-wrap:wrap;align-items:center}
+    textarea#jsonEditor{width:100%;height:280px}
+    .note{opacity:.75;font-size:12px}
+  </style>
+</head>
+<body>
+  <header>
+    <h1>pdfassembler editor</h1>
+    <div class="row">
+      <input id="fileInput" type="file" accept="application/pdf" />
+      <button id="loadSample" title="Fetch /public/sample.pdf">Load sample</button>
+      <span class="sp"></span>
+      <label class="note"><input id="indentToggle" type="checkbox"> pretty JSON</label>
+      <label class="note"><input id="compressToggle" type="checkbox"> compress output</label>
+      <button id="removeRootBtn" title="Remove /Outlines & /PageLabels from /Root">Strip outlines</button>
+      <button id="assembleBtn" title="Assemble & refresh" disabled>Assemble</button>
+      <button id="downloadBtn" disabled>Download</button>
+      <button id="canvasModeBtn" title="Switch to Canvas overlay mode">Canvas mode</button>
+    </div>
+  </header>
+
+  <div class="layout">
+    <!-- LEFT: Preview -->
+    <section class="card">
+      <div class="head">
+        <div class="tabs" id="previewModeTabs">
+          <button class="active" data-tab="native">Native PDF</button>
+          <button data-tab="canvas">Canvas</button>
+        </div>
+        <span class="sp"></span>
+        <div class="status" id="status">Ready.</div>
       </div>
-    </header>
-
-    <main>
-      <section class="left">
-        <h2>Editable PDF object structure</h2>
-        <div class="json-toolbar">
-          <button id="refreshPreviewBtn" disabled>Update from editor →</button>
-          <button id="syncFromTreeBtn" disabled>← Load latest structure</button>
-        </div>
-        <textarea id="jsonEditor" spellcheck="false" placeholder="Load a PDF to see and edit its object tree…"></textarea>
-
-        <details>
-          <summary>Quick actions (experimental)</summary>
-          <div class="quick-actions">
-            <label>Regex find: <input id="qaFind" placeholder="/Hello\\s+World/i or Hello\\s+World" /></label>
-            <label>Replace with: <input id="qaReplace" placeholder="Hi!" /></label>
-            <button id="qaRun">Run on content streams</button>
+      <div class="body">
+        <!-- Native viewer -->
+        <div id="panel-native" class="panel active">
+          <div class="toolbar" style="margin-bottom:.5rem">
+            <button id="refreshPreviewBtn" title="Re-assemble and refresh preview" disabled>Refresh preview</button>
+            <span class="note">PDF.js is only used in Canvas tab; this iframe uses the browser’s PDF viewer.</span>
           </div>
-        </details>
-
-        <!-- Text items (coalesced, compact) -->
-        <details id="textExplorer" open>
-          <summary>Text items (beta)</summary>
-          <div class="text-tools row" style="gap:8px;flex-wrap:wrap">
-            <button id="scanTextBtn">Scan text items</button>
-            <label>Filter: <input id="textFilter" placeholder="search…" /></label>
-            <label>Join ≤ <input id="xTol" type="number" value="4" min="0" step="0.5" style="width:70px" /> pt</label>
-            <label>Row y tol ≤ <input id="yTol" type="number" value="2" min="0" step="0.5" style="width:70px" /> pt</label>
-            <label>Step (pt): <input id="nudgeStep" type="number" value="1" min="0.25" step="0.25" style="width:80px" /></label>
-            <span id="scanStatus"></span>
-          </div>
-          <div id="textGroups" class="text-groups"></div>
-        </details>
-
-        <!-- NEW: Safe fields & metadata -->
-        <details id="safeExplorer" open>
-          <summary>Fields & Metadata (beta)</summary>
-          <div class="text-tools row" style="gap:8px;flex-wrap:wrap">
-            <button id="scanSafeBtn">Scan fields</button>
-            <label>Filter: <input id="safeFilter" placeholder="search…" /></label>
-            <span id="safeStatus"></span>
-          </div>
-          <div id="safeGroups" class="text-groups"></div>
-        </details>
-      </section>
-
-      <section class="right">
-        <h2>Preview</h2>
-        <div id="previewModeTabs" class="tabs">
-          <button data-tab="native" class="active">Built-in PDF viewer</button>
-          <button data-tab="canvas">Canvas (PDF.js) + overlay</button>
+          <iframe id="pdfFrame" title="PDF preview"></iframe>
         </div>
 
-        <div class="tab-panels">
-          <div id="panel-native" class="panel active">
-            <iframe id="pdfFrame" title="PDF preview"></iframe>
+        <!-- Canvas viewer -->
+        <div id="panel-canvas" class="panel">
+          <div id="canvasToolbar" class="toolbar" hidden>
+            <label>Page <input id="pageIndex" type="number" min="1" value="1" style="width:4.5rem"></label>
+            <button id="renderPage">Render</button>
+            <button id="addText">Add overlay text</button>
+            <button id="commitOverlay" title="Bake overlays into PDF content streams">Commit overlay</button>
           </div>
-          <div id="panel-canvas" class="panel">
-            <div id="canvasToolbar" class="row" hidden>
-              <button id="addText">Add text</button>
-              <button id="commitOverlay">Commit overlay as new content stream</button>
-              <label>Page: <input id="pageIndex" type="number" value="1" min="1" step="1" /></label>
-              <button id="renderPage">Render page</button>
+          <div class="canvasWrap">
+            <canvas id="pdfCanvas"></canvas>
+            <canvas id="overlayCanvas" class="overlay"></canvas>
+          </div>
+        </div>
+      </div>
+    </section>
+
+    <!-- RIGHT: Tools -->
+    <section class="card">
+      <div class="head">
+        <h2>Tools</h2>
+        <span class="sp"></span>
+        <button id="syncFromTreeBtn" title="Overwrite editor with current in-memory tree" disabled>Sync from tree</button>
+      </div>
+      <div class="body">
+
+        <!-- Quick Action -->
+        <div class="text-group">
+          <h3>Quick action — regex replace (streams)</h3>
+          <div class="body" style="padding:.5rem">
+            <div class="grid2">
+              <label class="mono small">Find (regex or /pat/flags)
+                <input id="qaFind" type="text" placeholder="/Invoice/g" />
+              </label>
+              <label class="mono small">Replace with
+                <input id="qaReplace" type="text" placeholder="Tax Invoice" />
+              </label>
             </div>
-            <div class="canvasWrap">
-              <canvas id="pdfCanvas"></canvas>
-              <canvas id="overlayCanvas"></canvas>
+            <div class="toolbar" style="margin-top:.4rem">
+              <button id="qaRun">Run replace</button>
+              <span class="note">Applies to all content streams.</span>
             </div>
-            <p class="note">Tip: overlay text boxes will be appended as a new content stream on the selected page using Helvetica.</p>
           </div>
         </div>
-      </section>
-    </main>
 
-    <script type="module" src="./main.js"></script>
-  </body>
+        <!-- Text panel -->
+        <div class="text-group">
+          <h3>Text items (Tj/TJ)</h3>
+          <div class="body" style="padding:.5rem">
+            <div class="toolbar">
+              <button id="scanTextBtn">Scan text</button>
+              <input id="textFilter" type="text" placeholder="Filter…" />
+              <label>xTol <input id="xTol" type="number" step="0.5" value="4" style="width:5rem"></label>
+              <label>yTol <input id="yTol" type="number" step="0.5" value="2" style="width:5rem"></label>
+              <label>nudge <input id="nudgeStep" type="number" step="0.5" value="1" style="width:5rem"></label>
+              <span id="scanStatus" class="note"></span>
+            </div>
+            <div id="textGroups"></div>
+          </div>
+        </div>
+
+        <!-- XObject / Images panel -->
+        <div class="text-group">
+          <h3>XObjects / Images</h3>
+          <div class="body" style="padding:.5rem">
+            <div class="toolbar">
+              <button id="scanXBtn">Scan XObjects</button>
+              <input id="xobjFilter" type="text" placeholder="Filter… e.g. Image, Form, Im1" />
+              <label>nudge <input id="xNudgeStep" type="number" step="0.5" value="1" style="width:5rem"></label>
+              <label>scale <input id="xScaleStep" type="number" step="0.01" value="0.05" style="width:6rem"></label>
+              <span id="xobjStatus" class="note"></span>
+            </div>
+            <div id="xobjGroups"></div>
+          </div>
+        </div>
+
+        <!-- SVG / Paths / Tables panel -->
+        <div class="text-group">
+          <h3>SVG / Paths / Tables</h3>
+          <div class="body" style="padding:.5rem">
+            <div class="toolbar">
+              <button id="scanPathsBtn">Scan vectors</button>
+              <input id="pathFilter" type="text" placeholder="Filter… e.g. rect, path, B, f*" />
+              <label>nudge <input id="pNudgeStep" type="number" step="0.5" value="1" style="width:5rem"></label>
+              <label>scale <input id="pScaleStep" type="number" step="0.01" value="0.05" style="width:6rem"></label>
+              <label class="note"><input id="tablesMode" type="checkbox" /> Tables mode (group rect rows)</label>
+              <span id="pathStatus" class="note"></span>
+            </div>
+            <div id="pathGroups"></div>
+          </div>
+        </div>
+
+        <!-- Safe panel -->
+        <div class="text-group">
+          <h3>Safe fields & metadata</h3>
+          <div class="body" style="padding:.5rem">
+            <div class="toolbar">
+              <button id="scanSafeBtn">Scan safe items</button>
+              <input id="safeFilter" type="text" placeholder="Filter…" />
+              <span id="safeStatus" class="note"></span>
+            </div>
+            <div id="safeGroups"></div>
+          </div>
+        </div>
+
+        <!-- JSON Editor -->
+        <div class="text-group">
+          <h3>PDF object tree (live)</h3>
+          <div class="body" style="padding:.5rem">
+            <textarea id="jsonEditor" class="mono" spellcheck="false"></textarea>
+            <div class="toolbar" style="margin-top:.4rem">
+              <button id="refreshPreviewBtn" title="Parse editor JSON and assemble" disabled>Apply & Assemble</button>
+              <span class="note">Edits here can break the PDF if you change structural objects incorrectly. Prefer the panels above.</span>
+            </div>
+          </div>
+        </div>
+
+      </div>
+    </section>
+  </div>
+
+  <!-- app -->
+  <script type="module" src="./main.js"></script>
+</body>
 </html>
