@@ -73,7 +73,7 @@ const els = {
   scanTextBtn: $('#scanTextBtn'),
   textFilter: $('#textFilter'),
   xTol: $('#xTol'),
- that yTol: $('#yTol'),
+  yTol: $('#yTol'),
   nudgeStep: $('#nudgeStep'),
   scanStatus: $('#scanStatus'),
   textGroups: $('#textGroups'),
