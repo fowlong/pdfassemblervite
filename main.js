@@ -84,7 +84,7 @@ const els = {
   xobjGroups: $('#xobjGroups'),
   xNudgeStep: $('#xNudgeStep'),
   xScaleStep: $('#xScaleStep'),
-  // SVG/Paths/Tables (stub)
+  // SVG/Paths/Tables
   scanPathsBtn: $('#scanPathsBtn'),
   pathFilter: $('#pathFilter'),
   pathStatus: $('#pathStatus'),
@@ -133,7 +133,7 @@ class RPCWorker {
   terminate() { this.worker.terminate(); }
 }
 
-// Tiny pool for scanner tasks
+// Tiny pool for scanner tasks (text + xobjects)
 class ScannerPool {
   constructor(concurrency = 2) {
     this.workers = new Array(concurrency).fill(0).map((_, i) =>
@@ -169,8 +169,20 @@ class ScannerPool {
   }
   terminate() { this.workers.forEach(w => w.terminate()); }
 }
-
 const scanners = new ScannerPool(2);
+
+/* ------------- Vector worker (paths/rects) ------------- */
+// This worker uses simple postMessage protocol (not RPC), so we wire it separately.
+let vectorWorker = null;
+function initVectorWorker() {
+  try {
+    vectorWorker = new Worker(new URL('./workers/vector.worker.js', import.meta.url), { type: 'module' });
+  } catch (e) {
+    console.warn('Vector worker unavailable; will fall back to sync scan.', e);
+    vectorWorker = null;
+  }
+}
+initVectorWorker();
 
 /* ---------------- UI wiring ---------------- */
 
@@ -252,8 +264,11 @@ function wireUi() {
   els.scanXBtn?.addEventListener('click', () => { if (!state.pdfTree) return toast('Load a PDF first.', true); scanXObjects(); });
   els.xobjFilter?.addEventListener('input', () => renderXGroups());
 
-  // Paths panel (stub)
-  els.scanPathsBtn?.addEventListener('click', () => { scanPaths(); });
+  // Paths panel
+  els.scanPathsBtn?.addEventListener('click', () => { if (!state.pdfTree) return toast('Load a PDF first.', true); scanPaths(); });
+  els.pathFilter?.addEventListener('input', () => renderPathGroups());
+  els.pNudgeStep?.addEventListener('change', renderPathGroups);
+  els.pScaleStep?.addEventListener('change', renderPathGroups);
 
   // Safe panel
   els.scanSafeBtn?.addEventListener('click', () => { if (!state.pdfTree) return toast('Load a PDF first.', true); scanSafeItems(); });
@@ -297,6 +312,7 @@ async function loadPdf(file) {
     // initial scans (parallel)
     scanTextItems();
     scanXObjects();
+    scanPaths();
     scanSafeItems();
   } catch (e) {
     console.error(e);
@@ -384,7 +400,7 @@ async function forceAssembleAndFullRescan() {
     state.assembling = true;
     await assembleAndPreviewConditional();
     if (state.lastUint8) await rehydrateFromBytes(state.lastUint8);
-    await Promise.all([ scanTextItems(), scanXObjects(), scanSafeItems() ]);
+    await Promise.all([ scanTextItems(), scanXObjects(), scanPaths(), scanSafeItems() ]);
     maybeRefreshJsonEditor(true);
   } catch (e) {
     console.error(e);
@@ -405,8 +421,8 @@ function scheduleAssemble({ pageIndex = null, reason = 'text' } = {}) {
 
     const pages = [...dirtyPages];
     dirtyPages.clear();
-    if (pages.length) { scanTextItems(pages); scanXObjects(pages); }
-    else { scanTextItems(); scanXObjects(); }
+    if (pages.length) { scanTextItems(pages); scanXObjects(pages); scanPaths(pages); }
+    else { scanTextItems(); scanXObjects(); scanPaths(); }
 
     if (reason !== 'text') scanSafeItems();
 
@@ -414,7 +430,7 @@ function scheduleAssemble({ pageIndex = null, reason = 'text' } = {}) {
     idleRehydrateTimer = setTimeout(async () => {
       if (state.lastUint8) {
         await rehydrateFromBytes(state.lastUint8);
-        if (pages.length) { scanTextItems(pages); scanXObjects(pages); }
+        if (pages.length) { scanTextItems(pages); scanXObjects(pages); scanPaths(pages); }
         maybeRefreshJsonEditor(true);
       }
     }, 1200);
@@ -831,10 +847,180 @@ async function xApplyMatrix(it, a,b,c,d,e,f){
 async function xNudge(it, dx, dy){ await xApplyMatrix(it, it.a, it.b, it.c, it.d, it.e + dx, it.f + dy); }
 async function xScale(it, sx, sy){ await xApplyMatrix(it, it.a * sx, it.b, it.c, it.d * sy, it.e, it.f); }
 
-/* ---------------- (Stub) Paths panel ---------------- */
-async function scanPaths(onlyPages = null){
-  if (els.pathStatus) els.pathStatus.textContent = 'Vector scan: not implemented in worker yet.';
-  if (els.pathGroups) els.pathGroups.innerHTML = '';
+/* ---------------- Paths / SVG-ish (rects + paint ops) ---------------- */
+
+let PATH_GROUPS = []; // [{pageIndex, items:[{kind:'rect'|'path', op, streamIndex, start,end, hasCM, cmIndex, cmText, a,b,c,d,e,f, rect?}]}]
+
+function renderPathGroups(){
+  const wrap = els.pathGroups; if (!wrap) return;
+  const filter = (els.pathFilter?.value || '').toLowerCase();
+  const step   = Number(els.pNudgeStep?.value || 1);
+  const sStep  = Number(els.pScaleStep?.value || 0.05);
+  wrap.innerHTML = '';
+
+  let total = 0;
+  PATH_GROUPS.forEach(group=>{
+    const visible = group.items.filter(it => !filter || (`${it.kind} ${it.op||''}`).toLowerCase().includes(filter));
+    total += visible.length;
+    const box = document.createElement('div'); box.className='text-group';
+    box.innerHTML = `<h3>Page ${group.pageIndex+1} — ${visible.length} vector item(s)</h3>`;
+    visible.forEach(it => box.appendChild(renderPathItem(group.pageIndex, it, step, sStep)));
+    wrap.appendChild(box);
+  });
+  if (els.pathStatus) els.pathStatus.textContent = `${total} vector item(s).`;
+}
+
+function renderPathItem(pageIndex, it, step, sStep){
+  const d = document.createElement('details'); d.className='text-item';
+  const axisAligned = Math.abs(it.b||0) < 1e-6 && Math.abs(it.c||0) < 1e-6;
+  d.innerHTML = `
+    <summary>
+      <span class="ellipsis">${it.kind} <small>${it.op || ''}</small></span>
+      <span class="meta">
+        <span class="badge">p${pageIndex+1}</span>
+        <span class="badge">${it.hasCM ? 'cm' : 'no cm'}</span>
+        <span class="badge">x:${fmtNum(it.e||0)} y:${fmtNum(it.f||0)}</span>
+        ${axisAligned ? `<span class="badge">sx:${fmtNum(it.a||1)} sy:${fmtNum(it.d||1)}</span>` : `<span class="badge">matrix</span>`}
+      </span>
+    </summary>
+    <div class="edit">
+      <div class="text-xy">
+        <label>X: <input class="vp-x" type="number" step="0.5" value="${numOrEmpty(it.e)}"></label>
+        <label>Y: <input class="vp-y" type="number" step="0.5" value="${numOrEmpty(it.f)}"></label>
+      </div>
+      <div class="font-mini">
+        <label>sX: <input class="vp-sx" type="number" step="0.01" value="${it.a ?? 1}"></label>
+        <label>sY: <input class="vp-sy" type="number" step="0.01" value="${it.d ?? 1}"></label>
+        <button class="vp-apply">Apply</button>
+      </div>
+      <div class="nudges">
+        <button class="nL">←</button>
+        <button class="nU">↑</button>
+        <button class="nD">↓</button>
+        <button class="nR">→</button>
+        <button class="sDown">– size</button>
+        <button class="sUp">+ size</button>
+        <button class="reset">reset cm</button>
+      </div>
+    </div>
+  `;
+  const q = s => d.querySelector(s);
+  q('.nL').onclick = async () => pNudge(pageIndex, it, -step, 0);
+  q('.nR').onclick = async () => pNudge(pageIndex, it, +step, 0);
+  q('.nU').onclick = async () => pNudge(pageIndex, it, 0, +step);
+  q('.nD').onclick = async () => pNudge(pageIndex, it, 0, -step);
+  q('.sUp').onclick = async () => pScale(pageIndex, it, 1+sStep, 1+sStep);
+  q('.sDown').onclick = async () => pScale(pageIndex, it, 1/(1+sStep), 1/(1+sStep));
+  q('.reset').onclick = async () => pApplyMatrix(pageIndex, it, 1,0,0,1,0,0);
+  q('.vp-apply').onclick = async () => {
+    const sx = Number(q('.vp-sx').value), sy = Number(q('.vp-sy').value);
+    const tx = Number(q('.vp-x').value),  ty = Number(q('.vp-y').value);
+    if (![sx,sy,tx,ty].every(Number.isFinite)) return toast('Enter valid numbers', true);
+    await pApplyMatrix(pageIndex, it, sx,0,0,sy,tx,ty);
+  };
+  q('.vp-x').onchange = async () => { const tx = Number(q('.vp-x').value); if(Number.isFinite(tx)) await pApplyMatrix(pageIndex, it, it.a||1,it.b||0,it.c||0,it.d||1,tx,it.f||0); };
+  q('.vp-y').onchange = async () => { const ty = Number(q('.vp-y').value); if(Number.isFinite(ty)) await pApplyMatrix(pageIndex, it, it.a||1,it.b||0,it.c||0,it.d||1,it.e||0,ty); };
+  return d;
+}
+
+function getStreamBy(pageIndex, streamIndex){
+  const page = state.pdfTree?.['/Root']?.['/Pages']?.['/Kids']?.[pageIndex];
+  const contents = page?.['/Contents']; const streams = Array.isArray(contents) ? contents : [contents];
+  const obj = streams[streamIndex];
+  return (obj && typeof obj.stream === 'string') ? obj : null;
+}
+function pfmt(n){ return (Math.round(n*10000)/10000).toString(); }
+
+async function pApplyMatrix(pageIndex, it, a,b,c,d,e,f){
+  const obj = getStreamBy(pageIndex, it.streamIndex); if(!obj) return toast('Stream not found.', true);
+  const s = obj.stream;
+  const token = `${pfmt(a)} ${pfmt(b)} ${pfmt(c)} ${pfmt(d)} ${pfmt(e)} ${pfmt(f)} cm`;
+  if (it.hasCM && it.cmIndex != null && typeof it.cmText === 'string') {
+    obj.stream = s.slice(0, it.cmIndex) + token + s.slice(it.cmIndex + it.cmText.length);
+  } else {
+    obj.stream = s.slice(0, it.start) + token + ' ' + s.slice(it.start);
+  }
+  it.hasCM = true; it.cmText = token; it.a=a; it.b=b; it.c=c; it.d=d; it.e=e; it.f=f;
+  maybeRefreshJsonEditor(true);
+  scheduleAssemble({ pageIndex, reason: 'vector' });
+}
+async function pNudge(pageIndex, it, dx, dy){ await pApplyMatrix(pageIndex, it, it.a||1, it.b||0, it.c||0, it.d||1, (it.e||0)+dx, (it.f||0)+dy); }
+async function pScale(pageIndex, it, sx, sy){ await pApplyMatrix(pageIndex, it, (it.a||1)*sx, it.b||0, it.c||0, (it.d||1)*sy, it.e||0, it.f||0); }
+
+/* Vector scanning with worker (or sync fallback) */
+function scanPaths(onlyPages = null){
+  if (!state.pdfTree) return;
+  const kids = state.pdfTree?.['/Root']?.['/Pages']?.['/Kids'];
+  const allPages = Array.isArray(kids) ? kids.map((_,i)=>i) : [];
+  const pages = Array.isArray(onlyPages) && onlyPages.length ? onlyPages : allPages;
+
+  const keep = new Map();
+  if (onlyPages && Array.isArray(PATH_GROUPS) && PATH_GROUPS.length) {
+    for (const g of PATH_GROUPS) keep.set(g.pageIndex, { pageIndex:g.pageIndex, items:[...g.items] });
+  }
+
+  // Build payload for worker
+  const payloadPages = pages.map(pIndex => {
+    const page = kids?.[pIndex];
+    const contents = page?.['/Contents']; const streams = Array.isArray(contents)? contents : [contents];
+    const streamText = streams.map(o => (o && typeof o.stream === 'string') ? o.stream : '');
+    return { pageIndex: pIndex, streams: streamText };
+  });
+
+  if (vectorWorker) {
+    const onMessage = (ev) => {
+      const { type, results } = ev.data || {};
+      if (type !== 'scanPaths:done') return;
+      vectorWorker.removeEventListener('message', onMessage);
+      results.forEach(pg => {
+        keep.set(pg.pageIndex, { pageIndex: pg.pageIndex, items: pg.items });
+      });
+      rebuildPathGroups(keep, kids?.length||0);
+      renderPathGroups();
+    };
+    vectorWorker.addEventListener('message', onMessage);
+    vectorWorker.postMessage({ type:'scanPaths', payload: { pages: payloadPages, options: {} } });
+  } else {
+    // sync fallback (simple regex pass)
+    for (const p of payloadPages) {
+      const items = [];
+      p.streams.forEach((src, streamIndex) => {
+        if (typeof src !== 'string' || !src.length) return;
+        // collect cm
+        const cms=[]; let m;
+        const cmRe=/(-?\d+(?:\.\d+)?)\s+(-?\d+(?:\.\d+)?)\s+(-?\d+(?:\.\d+)?)\s+(-?\d+(?:\.\d+)?)\s+(-?\d+(?:\.\d+)?)\s+(-?\d+(?:\.\d+)?)\s+cm/g;
+        while((m=cmRe.exec(src))) cms.push({ index:m.index, text:m[0], a:+m[1], b:+m[2], c:+m[3], d:+m[4], e:+m[5], f:+m[6] });
+        const lastCmBefore = pos => { let last=null; for (let i=0;i<cms.length;i++){ if (cms[i].index<pos) last=cms[i]; else break; } return last; };
+        // rects
+        const reRect=/(-?\d+(?:\.\d+)?)\s+(-?\d+(?:\.\d+)?)\s+(-?\d+(?:\.\d+)?)\s+(-?\d+(?:\.\d+)?)\s+re/g;
+        while((m=reRect.exec(src))){
+          const near=lastCmBefore(m.index);
+          items.push({ kind:'rect', op:'re', streamIndex, start:m.index, end:reRect.lastIndex,
+            hasCM:!!near, cmIndex:near?.index??null, cmText:near?.text??null,
+            a:near?.a??1,b:near?.b??0,c:near?.c??0,d:near?.d??1,e:near?.e??0,f:near?.f??0,
+            rect:{x:+m[1],y:+m[2],w:+m[3],h:+m[4]} });
+        }
+        // paint ops
+        const paintRe = /\b(S|s|f\*?|B\*?|b\*?|n)\b/g;
+        while((m=paintRe.exec(src))){
+          const near=lastCmBefore(m.index);
+          items.push({ kind:'path', op:m[1], streamIndex, start:m.index, end:paintRe.lastIndex,
+            hasCM:!!near, cmIndex:near?.index??null, cmText:near?.text??null,
+            a:near?.a??1,b:near?.b??0,c:near?.c??0,d:near?.d??1,e:near?.e??0,f:near?.f??0 });
+        }
+      });
+      keep.set(p.pageIndex, { pageIndex:p.pageIndex, items });
+    }
+    rebuildPathGroups(keep, kids?.length||0);
+    renderPathGroups();
+  }
+}
+
+function rebuildPathGroups(keep, totalPages){
+  PATH_GROUPS = [];
+  for (let i=0;i<totalPages;i++){
+    PATH_GROUPS.push(keep.get(i) || { pageIndex:i, items:[] });
+  }
 }
 
 /* ---------------- Safe items ---------------- */
