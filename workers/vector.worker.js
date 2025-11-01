@@ -10,7 +10,7 @@ self.onmessage = (e) => {
     const results = (pages || []).map(pg => scanPage(pg));
     self.postMessage({ type: 'scanPaths:done', results });
   }
-};a
+};
 
 function scanPage(pg) {
   const out = { pageIndex: pg.pageIndex, items: [] };
