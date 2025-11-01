@@ -9,8 +9,8 @@ self.process = self.process || {
 let PDFAssemblerClass = null;
 async function ensureLib() {
   if (!PDFAssemblerClass) {
-    const mod = await import('pdfassembler');
-    PDFAssemblerClass = mod.PDFAssembler;
+    const mod = await import('../shims/pdfassembler.js');
+    PDFAssemblerClass = mod.PDFAssembler || mod.default;
   }
 }
 
