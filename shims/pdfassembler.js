@@ -1,14 +1,42 @@
 // src/shims/pdfassembler.js
-// Import the package once and normalize the export shape.
-// This runs through Vite's CommonJS transform (because of optimizeDeps.include).
-import * as _mod from 'pdfassembler';
+// Normalize the various ways "pdfassembler" might export its constructor,
+// so both main thread and workers can import a single consistent value.
 
-// Possible shapes: {PDFAssembler}, default, or plain constructor.
-const PDFAssembler =
-  (_mod && _mod.PDFAssembler) ||
-  (_mod && _mod.default && (_mod.default.PDFAssembler || _mod.default)) ||
-  _mod.default ||
-  _mod;
+import * as ns from 'pdfassembler';
 
-export { PDFAssembler };
-export default PDFAssembler;
+/** @type {any} */
+let Ctor = null;
+
+// 1) ESM named export: { PDFAssembler }
+if (ns && typeof ns.PDFAssembler === 'function') {
+  Ctor = ns.PDFAssembler;
+}
+
+// 2) ESM/CJS default export is the class itself
+if (!Ctor && ns && typeof ns.default === 'function') {
+  Ctor = ns.default;
+}
+
+// 3) Default export is an object containing the class: { default: { PDFAssembler } }
+if (
+  !Ctor &&
+  ns &&
+  ns.default &&
+  typeof ns.default.PDFAssembler === 'function'
+) {
+  Ctor = ns.default.PDFAssembler;
+}
+
+// 4) CJS namespace itself is the constructor
+if (!Ctor && typeof ns === 'function') {
+  Ctor = ns;
+}
+
+if (!Ctor) {
+  throw new Error(
+    '[shim/pdfassembler] Could not locate PDFAssembler constructor in "pdfassembler" exports.'
+  );
+}
+
+export { Ctor as PDFAssembler };
+export default Ctor;
