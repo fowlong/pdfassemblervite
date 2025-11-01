@@ -5,7 +5,7 @@ self.process = self.process || {
   nextTick: cb => Promise.resolve().then(cb)
 };
 
-import { PDFAssembler } from 'pdfassembler';
+import PDFAssembler from '../shims/pdfassembler.js';
 
 const ok = (id, payload) => self.postMessage({ id, ok: true, ...payload });
 const fail = (id, err) =>
