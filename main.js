@@ -1,3 +1,4 @@
+// main.js
 // --- light polyfill so pdfassembler’s CJS deps don’t choke in browsers
 if (typeof window !== 'undefined') {
   window.global = window.global || window;
@@ -20,17 +21,18 @@ async function ensurePdfJs() {
   return pdfjsLib;
 }
 
-const $ = (sel) => document.querySelector(sel);
+const $  = (sel) => document.querySelector(sel);
 const $$ = (sel) => Array.from(document.querySelectorAll(sel));
 
 /* ---------------- State ---------------- */
 let state = {
-  asm: null,        // PDFAssembler instance
+  asm: null,
   pdfTree: null,
   lastBlobUrl: null,
   lastUint8: null,
   pageCount: 0,
-  assembling: false
+  assembling: false,
+  inputFile: null
 };
 
 // --- FAST EDIT MODE knobs
@@ -40,6 +42,185 @@ let assembleTimer = null;
 let idleRehydrateTimer = null;
 const dirtyPages = new Set();
 let lastJsonRefresh = 0;
+
+/* -------- Workers -------- */
+let incremental = false;
+let incWorker = null;
+let incOpened = false;
+
+let mapWorker = null;
+function ensureMapperWorker() {
+  if (mapWorker) return mapWorker;
+  mapWorker = new Worker(new URL('./workers/mapper.worker.js', import.meta.url), {
+    type: 'module',
+    name: 'mapper'
+  });
+  return mapWorker;
+}
+
+function ensureIncWorker() {
+  if (incWorker) return incWorker;
+  incWorker = new Worker(new URL('./workers/incremental.worker.js', import.meta.url), {
+    type: 'module',
+    name: 'inc-writer'
+  });
+  return incWorker;
+}
+function rpc(worker, type, payload, transfer = []) {
+  return new Promise((resolve, reject) => {
+    const id = Math.random().toString(36).slice(2);
+    const onMsg = (e) => {
+      const d = e.data || {};
+      if (d.id !== id) return;
+      worker.removeEventListener('message', onMsg);
+      if (d.ok) resolve(d.result);
+      else reject(new Error(d.error || 'worker error'));
+    };
+    worker.addEventListener('message', onMsg);
+    worker.postMessage({ id, type, payload }, transfer);
+  });
+}
+function incCall(type, payload, transfer = []) {
+  return rpc(ensureIncWorker(), type, payload, transfer);
+}
+function mapCall(type, payload, transfer = []) {
+  return rpc(ensureMapperWorker(), type, payload, transfer);
+}
+
+/* ---------- ID helpers ---------- */
+function objectIdOf(node) {
+  if (node && node.$obj && Number.isFinite(node.$obj.n)) return { n: node.$obj.n|0, g: node.$obj.g|0 };
+  if (node && node.__id && Number.isFinite(node.__id.n)) return { n: node.__id.n|0, g: node.__id.g|0 };
+  if (node && node.$id  && Number.isFinite(node.$id.n))  return { n: node.$id.n|0,  g: node.$id.g|0  };
+  if (node && node._id  && Number.isFinite(node._id.n))  return { n: node._id.n|0,  g: node._id.g|0  };
+  if (node && node.$ref && Number.isFinite(node.$ref.n)) return { n: node.$ref.n|0,  g: node.$ref.g|0  };
+  return null;
+}
+
+function flattenPagesFromTree(rootPages) {
+  const out = [];
+  function walk(node) {
+    if (!node || typeof node !== 'object') return;
+    const t = node['/Type'];
+    const isPage  = (t === '/Page') || (t && String(t).includes('/Page')) ||
+                    (node['/Contents'] != null && (node['/MediaBox'] || node['/CropBox']));
+    const kids = node['/Kids'];
+
+    if (isPage && !Array.isArray(kids)) {
+      out.push(node);
+      return;
+    }
+    if (Array.isArray(kids)) {
+      for (const k of kids) walk(k);
+    }
+  }
+  walk(rootPages);
+  // if recursive walk found nothing, try direct /Kids fallback
+  if (!out.length && Array.isArray(rootPages?.['/Kids'])) {
+    for (const k of rootPages['/Kids']) walk(k);
+  }
+  return out;
+}
+
+function mappingFromTree(tree) {
+  const rootPages = tree?.['/Root']?.['/Pages'];
+  const pagesNodes = flattenPagesFromTree(rootPages);
+  const pages = pagesNodes.map((p, i) => {
+    const pageObj = objectIdOf(p) || null;
+    const contents = [];
+    const c = p?.['/Contents'];
+    const arr = Array.isArray(c) ? c : (c ? [c] : []);
+    arr.forEach((obj) => contents.push(objectIdOf(obj) || null));
+    return { pageIndex: i, pageObj, contents };
+  });
+
+  return {
+    pages,
+    root: objectIdOf(tree?.['/Root']) || null,
+    info: objectIdOf(tree?.['/Info']) || null
+  };
+}
+
+// Merge tree mapping with byte-scan mapping so every page has concrete content IDs
+async function mergeMappingWithBytes(bytesU8, map) {
+  const copy = bytesU8.slice();
+  // Scan ALL pages from bytes (no pre-known IDs required)
+  const scan = await mapCall('scanAllPages', { bytes: copy.buffer }, [copy.buffer]);
+
+  if (!scan || !Array.isArray(scan.pages) || !scan.pages.length) {
+    // fallback: only resolve contents for pages where we DO know the page object id
+    const needsHelp = map.pages.filter(pg => pg?.pageObj && (!pg.contents.length || pg.contents.some(x => !x)));
+    if (needsHelp.length) {
+      const buf2 = bytesU8.slice();
+      const byPage = await mapCall(
+        'contentsForPages',
+        { bytes: buf2.buffer, pages: needsHelp.map(pg => pg.pageObj) },
+        [buf2.buffer]
+      );
+      map.pages = map.pages.map(pg => {
+        if (!pg?.pageObj) return pg;
+        const key = `${pg.pageObj.n} ${pg.pageObj.g}`;
+        const resolved = byPage[key];
+        if (Array.isArray(resolved) && resolved.length) return { ...pg, contents: resolved };
+        return pg;
+      });
+    }
+    return map;
+  }
+
+  // Align lengths (prefer the scanned count if tree-derived was empty or mismatched)
+  if (!map.pages.length || map.pages.length !== scan.pages.length) {
+    map.pages = new Array(scan.pages.length).fill(0).map((_, i) => ({
+      pageIndex: i, pageObj: null, contents: []
+    }));
+  }
+
+  // Merge page-by-index: fill any missing pageObj/contents from scan
+  map.pages = map.pages.map((pg, i) => {
+    const s = scan.pages[i];
+    const pageObj = pg.pageObj || s.pageObj || null;
+    const contents =
+      (!pg.contents.length || pg.contents.some(x => !x)) && Array.isArray(s.contents) && s.contents.length
+        ? s.contents
+        : pg.contents;
+    return { pageIndex: i, pageObj, contents };
+  });
+
+  // Carry root/info if tree didn’t have them
+  map.root = map.root || scan.root || null;
+  map.info = map.info || scan.info || null;
+
+  return map;
+}
+
+// NEW: open helpers
+async function ensureIncOpenWith(bytesU8) {
+  if (incOpened) return { pageCount: null };
+
+  let mapping = mappingFromTree(state.pdfTree);
+  mapping = await mergeMappingWithBytes(bytesU8, mapping);
+
+  const allGood = mapping.pages.length &&
+    mapping.pages.every(pg => Array.isArray(pg.contents) && pg.contents.length && pg.contents.every(Boolean));
+
+  if (!allGood) {
+    throw new Error('Incremental mapper could not resolve page/contents ids for this PDF.');
+  }
+
+  const copy = bytesU8.slice();
+  const res = await incCall('open', { bytes: copy.buffer, mapping }, [copy.buffer]);
+  incOpened = true;
+  return res; // { pageCount }
+}
+async function ensureIncOpen() {
+  if (incOpened) return;
+  let base = state.lastUint8;
+  if (!(base instanceof Uint8Array)) {
+    base = await assembleOnceReturnBytes();
+    state.lastUint8 = base;
+  }
+  await ensureIncOpenWith(base);
+}
 
 /* ---------------- Elements ---------------- */
 const els = {
@@ -96,6 +277,8 @@ const els = {
   safeFilter: $('#safeFilter'),
   safeStatus: $('#safeStatus'),
   safeGroups: $('#safeGroups'),
+  // Incremental toggle
+  incrementalToggle: $('#incrementalToggle'),
 };
 
 toast('Ready. Load a PDF to begin.');
@@ -103,7 +286,6 @@ wireUi();
 
 /* ---------------- Scanner worker pool ---------------- */
 
-// Simple RPC wrapper
 class RPCWorker {
   constructor(url, { name = 'worker' } = {}) {
     this.worker = new Worker(url, { type: 'module', name });
@@ -172,7 +354,6 @@ class ScannerPool {
 const scanners = new ScannerPool(2);
 
 /* ------------- Vector worker (paths/rects) ------------- */
-// This worker uses simple postMessage protocol (not RPC), so we wire it separately.
 let vectorWorker = null;
 function initVectorWorker() {
   try {
@@ -273,6 +454,29 @@ function wireUi() {
   // Safe panel
   els.scanSafeBtn?.addEventListener('click', () => { if (!state.pdfTree) return toast('Load a PDF first.', true); scanSafeItems(); });
   els.safeFilter?.addEventListener('input', () => renderSafeGroups());
+
+  // Incremental toggle (OPEN immediately)
+  els.incrementalToggle?.addEventListener('change', async () => {
+    if (els.incrementalToggle.checked) {
+      try {
+        await ensureIncOpen(); // opens WITH merged mapping
+        const res = await incCall('getMapping', {});
+        const pc = Array.isArray(res?.pages) ? res.pages.length : 0;
+        if (!pc) throw new Error('Incremental mapper reported 0 pages.');
+        incremental = true;
+        toast('Incremental mode ON');
+      } catch (e) {
+        console.warn('Incremental open failed:', e);
+        incremental = false;
+        incOpened = false;
+        els.incrementalToggle.checked = false;
+        toast('Incremental mode unsupported for this PDF. Staying in full mode.', true);
+      }
+    } else {
+      incremental = false;
+      toast('Incremental mode OFF');
+    }
+  });
 }
 
 /* ---------------- Load / Assemble on main thread ---------------- */
@@ -285,6 +489,12 @@ async function loadPdf(file) {
     // start in fast mode
     els.compressToggle.checked = false;
     els.indentToggle.checked = false;
+
+    // keep a handle to the input and its bytes
+    state.inputFile = file;
+    const buf = await file.arrayBuffer();
+    const orig = new Uint8Array(buf);
+    state.lastUint8 = orig;
 
     state.asm = new PDFAssembler(file);
     state.asm.compress = false;
@@ -305,9 +515,28 @@ async function loadPdf(file) {
     els.removeRootBtn.disabled = false;
     els.canvasModeBtn.disabled = false;
 
-    // show original PDF
     setFrameUrl(URL.createObjectURL(file));
     toast('PDF loaded.');
+
+    incOpened = false;
+
+    if (els.incrementalToggle?.checked) {
+      try {
+        const res = await ensureIncOpenWith(orig);
+        const pc = (res && typeof res.pageCount === 'number') ? res.pageCount : 0;
+        if (!pc) throw new Error('Incremental mapper reported 0 pages.');
+        console.log(`Incremental: mapping ready (${pc} page(s)).`);
+        incremental = true;
+      } catch (e) {
+        console.warn('Incremental open failed; disabling incremental for this file.', e);
+        incremental = false;
+        incOpened = false;
+        els.incrementalToggle.checked = false;
+        toast('Incremental mode unsupported for this PDF (mapping failed). Using full mode.', true);
+      }
+    } else {
+      incremental = false;
+    }
 
     // initial scans (parallel)
     scanTextItems();
@@ -410,14 +639,68 @@ async function forceAssembleAndFullRescan() {
   }
 }
 
-// Debounced incremental assemble + selective rescans
+// Debounced assemble + selective rescans
 function scheduleAssemble({ pageIndex = null, reason = 'text' } = {}) {
   if (pageIndex != null) dirtyPages.add(pageIndex);
   if (assembleTimer) clearTimeout(assembleTimer);
 
   assembleTimer = setTimeout(async () => {
     assembleTimer = null;
-    await assembleAndPreviewConditional();
+
+    if (!incremental) {
+      await assembleAndPreviewConditional();
+    } else {
+      try {
+        await ensureIncOpen(); // mapping guaranteed
+      } catch (e) {
+        console.warn('Incremental ensure-open failed:', e);
+        toast('Incremental mode failed to initialize. See console.', true);
+        return;
+      }
+
+      const kids = state.pdfTree?.['/Root']?.['/Pages']?.['/Kids'] || [];
+      const pagesDirty = [...dirtyPages];
+      const targetPages = pagesDirty.length ? pagesDirty : [];
+
+      const edits = [];
+      for (const p of targetPages) {
+        const page = kids[p];
+        if (!page) continue;
+        const contents = page?.['/Contents'];
+        const streams = Array.isArray(contents) ? contents : [contents];
+        streams.forEach((obj, sIdx) => {
+          if (!obj || typeof obj.stream !== 'string') return;
+          const id = objectIdOf(obj);
+          if (id) edits.push({ obj: id, streamText: obj.stream });
+          else    edits.push({ pageIndex: p, streamIndex: sIdx, streamText: obj.stream });
+        });
+      }
+
+      if (edits.length) {
+        try {
+          const res = await incCall('applyEdits', { edits });
+
+          // Defensive copy of worker output so we never hold a transferred buffer
+          const fromWorker = new Uint8Array(res.uint8);
+          const bytes = new Uint8Array(fromWorker.length);
+          bytes.set(fromWorker);
+
+          state.lastUint8 = bytes;
+
+          if (isNativeViewerActive()) {
+            const blob = new Blob([bytes], { type: 'application/pdf' });
+            const url = URL.createObjectURL(blob);
+            setFrameUrl(url);
+            els.downloadBtn.disabled = false;
+            els.downloadBtn.onclick = () => downloadBlob(blob, 'edited.pdf');
+          }
+          toast('Incremental update appended.');
+        } catch (e) {
+          console.error(e);
+          toast('Incremental update failed. See console.', true);
+        }
+      }
+    }
 
     const pages = [...dirtyPages];
     dirtyPages.clear();
@@ -428,10 +711,13 @@ function scheduleAssemble({ pageIndex = null, reason = 'text' } = {}) {
 
     if (idleRehydrateTimer) clearTimeout(idleRehydrateTimer);
     idleRehydrateTimer = setTimeout(async () => {
-      if (state.lastUint8) {
+      if (!state.lastUint8) return;
+      try {
         await rehydrateFromBytes(state.lastUint8);
         if (pages.length) { scanTextItems(pages); scanXObjects(pages); scanPaths(pages); }
         maybeRefreshJsonEditor(true);
+      } catch (err) {
+        console.warn('rehydrate failed (keeping previous tree):', err);
       }
     }, 1200);
   }, ASSEMBLE_DEBOUNCE_MS);
@@ -444,9 +730,25 @@ function setFrameUrl(url) {
   state.lastBlobUrl = url;
   els.pdfFrame.src = url;
 }
-function downloadBlob(blob, name) { const a = document.createElement('a'); a.href = URL.createObjectURL(blob); a.download = name; document.body.appendChild(a); a.click(); a.remove(); }
-function toast(msg, error=false) { els.status.textContent = msg; els.status.style.color = error ? '#ffb0b0' : '#cce7ff'; if (!error) console.log(msg); }
-function resetPreview(){ if(state.lastBlobUrl) URL.revokeObjectURL(state.lastBlobUrl); state.lastBlobUrl=null; state.lastUint8=null; els.pdfFrame.removeAttribute('src'); }
+function downloadBlob(blob, name) {
+  const a = document.createElement('a');
+  a.href = URL.createObjectURL(blob);
+  a.download = name;
+  document.body.appendChild(a);
+  a.click();
+  a.remove();
+}
+function toast(msg, error=false) {
+  els.status.textContent = msg;
+  els.status.style.color = error ? '#ffb0b0' : '#cce7ff';
+  if (!error) console.log(msg);
+}
+function resetPreview(){
+  if(state.lastBlobUrl) URL.revokeObjectURL(state.lastBlobUrl);
+  state.lastBlobUrl=null;
+  state.lastUint8=null;
+  els.pdfFrame.removeAttribute('src');
+}
 
 /* ---------------- Quick Action: regex replace ---------------- */
 
@@ -511,7 +813,11 @@ async function renderCanvasPage() {
   els.overlayCanvas.width = canvas.width; els.overlayCanvas.height = canvas.height;
   clearOverlay();
 }
-function clearOverlay() { const octx = els.overlayCanvas.getContext('2d'); octx.clearRect(0,0,els.overlayCanvas.width, els.overlayCanvas.height); overlayItems.length = 0; }
+function clearOverlay() {
+  const octx = els.overlayCanvas.getContext('2d');
+  octx.clearRect(0,0,els.overlayCanvas.width, els.overlayCanvas.height);
+  overlayItems.length = 0;
+}
 
 // Simple draggable overlay
 const overlayItems = []; let dragIndex = -1; let lastDrag=null;
@@ -658,7 +964,7 @@ async function replaceGroupText(it, newText){
 }
 
 function localReFindStreamToken(s, start, end){
-  const isWs = ch => ch===' '||ch==='\n'||ch==='\r'||ch==='\t'||ch==='\f'||ch==='\v';
+  const isWs = ch => ch===' '||ch==='\n'||ch==='\r'||ch==='\t'||ch==='\f'||ch=='\v';
   const winStart = Math.max(0, start - 400);
   const winEnd   = Math.min(s.length, end + 400);
   const win = s.slice(winStart, winEnd);
@@ -959,7 +1265,6 @@ function scanPaths(onlyPages = null){
     for (const g of PATH_GROUPS) keep.set(g.pageIndex, { pageIndex:g.pageIndex, items:[...g.items] });
   }
 
-  // Build payload for worker
   const payloadPages = pages.map(pIndex => {
     const page = kids?.[pIndex];
     const contents = page?.['/Contents']; const streams = Array.isArray(contents)? contents : [contents];
@@ -981,17 +1286,14 @@ function scanPaths(onlyPages = null){
     vectorWorker.addEventListener('message', onMessage);
     vectorWorker.postMessage({ type:'scanPaths', payload: { pages: payloadPages, options: {} } });
   } else {
-    // sync fallback (simple regex pass)
     for (const p of payloadPages) {
       const items = [];
       p.streams.forEach((src, streamIndex) => {
         if (typeof src !== 'string' || !src.length) return;
-        // collect cm
         const cms=[]; let m;
         const cmRe=/(-?\d+(?:\.\d+)?)\s+(-?\d+(?:\.\d+)?)\s+(-?\d+(?:\.\d+)?)\s+(-?\d+(?:\.\d+)?)\s+(-?\d+(?:\.\d+)?)\s+(-?\d+(?:\.\d+)?)\s+cm/g;
         while((m=cmRe.exec(src))) cms.push({ index:m.index, text:m[0], a:+m[1], b:+m[2], c:+m[3], d:+m[4], e:+m[5], f:+m[6] });
         const lastCmBefore = pos => { let last=null; for (let i=0;i<cms.length;i++){ if (cms[i].index<pos) last=cms[i]; else break; } return last; };
-        // rects
         const reRect=/(-?\d+(?:\.\d+)?)\s+(-?\d+(?:\.\d+)?)\s+(-?\d+(?:\.\d+)?)\s+(-?\d+(?:\.\d+)?)\s+re/g;
         while((m=reRect.exec(src))){
           const near=lastCmBefore(m.index);
@@ -1000,7 +1302,6 @@ function scanPaths(onlyPages = null){
             a:near?.a??1,b:near?.b??0,c:near?.c??0,d:near?.d??1,e:near?.e??0,f:near?.f??0,
             rect:{x:+m[1],y:+m[2],w:+m[3],h:+m[4]} });
         }
-        // paint ops
         const paintRe = /\b(S|s|f\*?|B\*?|b\*?|n)\b/g;
         while((m=paintRe.exec(src))){
           const near=lastCmBefore(m.index);
